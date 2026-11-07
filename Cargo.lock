@@ -176,7 +176,6 @@ version = "0.1.0"
 dependencies = [
  "bkr1x-hal",
  "bkr1x-protocol",
- "serde",
  "serde_json",
  "windows-sys 0.59.0",
  "winresource",
@@ -212,7 +211,6 @@ version = "0.1.0"
 dependencies = [
  "bkr1x-hal",
  "eframe",
- "windows-sys 0.59.0",
  "winresource",
 ]
 

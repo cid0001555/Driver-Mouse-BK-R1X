@@ -1,9 +1,6 @@
-//! Cross-platform Hardware Abstraction Layer (`hidraw` on Linux, `hid.dll` on Windows),
-//! TOML/JSON profile serializer, procedural icon generator, OS startup manager,
-//! and ultra-low-latency IPC primitives for the Fire Phoenix BK-R1X.
-
 pub mod device;
 pub mod error;
+pub mod hex;
 pub mod icon;
 pub mod ipc;
 pub mod profile;
@@ -15,7 +12,8 @@ pub use device::{
     TraceDirection, WireTraceEntry, discover_best_interface,
 };
 pub use error::DeviceError;
-pub use icon::{TrayIconStatus, encode_ico_file, render_mouse_icon_rgba};
+pub use hex::{decode_flexible_hex, encode_hex_spaced};
+pub use icon::{TrayIconStatus, encode_ico_file, encode_icon_dib, render_mouse_icon_rgba};
 pub use ipc::{
     DaemonStatusSnapshot, IpcRequest, IpcResponse, IpcWireTrace, is_daemon_running,
     send_ipc_request, unix_socket_path,
@@ -23,30 +21,54 @@ pub use ipc::{
 pub use profile::HardwareProfile;
 pub use sfx::{SFX_FOOTER_MAGIC, SfxBundle, extract_sfx_from_exe, pack_sfx_installer};
 pub use startup::{
-    InstallOptions, InstallSummary, ensure_user_profiles_dir, install_user_application,
-    install_with_options, is_autostart_enabled, is_user_application_installed, list_saved_profiles,
-    resolve_sibling_binary, set_autostart_enabled, uninstall_user_application,
-    uninstall_user_application_full, user_config_dir, user_install_dir,
+    GUI_WINDOW_TITLE, InstallOptions, InstallSummary, ensure_user_profiles_dir,
+    install_user_application, install_with_options, is_autostart_enabled, is_profile_extension,
+    is_user_application_installed, list_saved_profiles, platform_exe_name, resolve_sibling_binary,
+    set_autostart_enabled, uninstall_user_application, uninstall_user_application_full,
+    user_config_dir, user_install_dir,
 };
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use bkr1x_protocol::{ButtonMapping, MouseConfig};
+    use bkr1x_protocol::{
+        ButtonAction, ButtonMapping, KeyModifiers, MediaFunction, MouseClickButton, MouseConfig,
+    };
 
     use super::*;
 
     #[test]
-    fn profile_toml_roundtrip_and_validation() {
+    fn profile_toml_roundtrip_preserves_all_media_modifiers_and_raw_descriptors() {
         let cfg = MouseConfig::factory_default();
-        let btns = ButtonMapping::factory_default();
-        let prof = HardwareProfile::from_hardware("UnitTest", &cfg, &btns);
+        for media in MediaFunction::ALL {
+            let mut btns = ButtonMapping::factory_default();
+            btns.slots[1] = ButtonAction::Media(media);
+            btns.slots[2] = ButtonAction::KeyboardShortcut {
+                modifiers: KeyModifiers(KeyModifiers::RCTRL | KeyModifiers::LSHIFT),
+                keycode: 0x06,
+            };
+            btns.slots[3] = ButtonAction::Raw([0xAB, 0xCD, 0x12, 0x34]);
 
-        let serialized = toml::to_string_pretty(&prof).unwrap();
-        let parsed: HardwareProfile = toml::from_str(&serialized).unwrap();
-        assert_eq!(parsed.to_mouse_config().unwrap(), cfg);
-        assert_eq!(parsed.to_button_mapping().unwrap(), btns);
+            let prof = HardwareProfile::from_hardware("LosslessTest", &cfg, &btns);
+            let serialized = toml::to_string_pretty(&prof).unwrap();
+            let parsed: HardwareProfile = toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.to_mouse_config().unwrap(), cfg);
+            assert_eq!(parsed.to_button_mapping().unwrap(), btns);
+            assert_eq!(
+                parsed.to_button_mapping().unwrap().slots[0],
+                ButtonAction::MouseClick(MouseClickButton::Left)
+            );
+        }
+    }
+
+    #[test]
+    fn hex_codec_handles_prefixed_and_spaced_inputs_without_panic() {
+        let raw = decode_flexible_hex("0x00, 0x55, 0f:AE-0a").unwrap();
+        assert_eq!(raw, vec![0x00, 0x55, 0x0F, 0xAE, 0x0A]);
+        assert_eq!(encode_hex_spaced(&raw), "00 55 0f ae 0a");
+        assert!(decode_flexible_hex("0x0").is_err());
+        assert!(decode_flexible_hex("zz").is_err());
     }
 
     #[test]
@@ -68,7 +90,7 @@ mod tests {
     #[test]
     fn procedural_ico_generation_is_valid() {
         let ico = encode_ico_file(&[16, 32, 48], TrayIconStatus::default());
-        assert_eq!(&ico[0..6], &[0, 0, 1, 0, 3, 0]); // ICONDIR with 3 images
+        assert_eq!(&ico[0..6], &[0, 0, 1, 0, 3, 0]);
     }
 
     #[test]

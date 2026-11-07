@@ -1,52 +1,54 @@
-//! Validated domain types for PAW3311 sensor registers, button bindings, and hardware macros.
-
 use core::fmt;
 
 use crate::constants::{
-    BUTTON_SLOT_COUNT, MACRO_DIRECTORY_LEN, MACRO_FLASH_TOTAL_LEN, MAX_DEBOUNCE_MS,
-    MAX_DPI_STAGES, MAX_MACRO_SLOTS, PAW3311_DPI_MAX, PAW3311_DPI_MIN, PAW3311_DPI_STEP,
+    BUTTON_SLOT_COUNT, MACRO_DIRECTORY_LEN, MACRO_FLASH_TOTAL_LEN, MAX_DEBOUNCE_MS, MAX_DPI_STAGES,
+    MAX_MACRO_SLOTS, PAW3311_DPI_MAX, PAW3311_DPI_MIN, PAW3311_DPI_STEP,
 };
 
-/// Strict validation and protocol decoding errors (`#![no_std]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolError {
-    /// Packet buffer is shorter than required for framing.
-    PacketTooShort { actual: usize, expected_min: usize },
-    /// Packet header byte did not match expected `0x55` (TX) or `0xAA` (RX).
+    PacketTooShort {
+        actual: usize,
+        expected_min: usize,
+    },
     InvalidMagicHeader(u8),
-    /// Checksum verification failed for the selected [`crate::ChecksumStrategy`].
     ChecksumMismatch,
-    /// Unknown or unsupported command opcode.
     UnknownOpcode(u8),
-    /// PAW3311 DPI value outside `50..=18000` or not aligned to `50` DPI increments.
-    InvalidDpi { stage: usize, value: u16 },
-    /// Active DPI stage count must be in `1..=6`.
+    InvalidDpi {
+        stage: usize,
+        value: u16,
+    },
     InvalidDpiCount(u8),
-    /// Active DPI stage index must be `< dpi_count`.
-    InvalidActiveDpiStage { active_index: u8, count: u8 },
-    /// Unsupported USB/2.4GHz polling rate (must be `125`, `250`, `500`, or `1000` Hz).
+    InvalidActiveDpiStage {
+        active_index: u8,
+        count: u8,
+    },
     InvalidPollingRate(u16),
-    /// Unsupported PAW3311 Lift-Off Distance (must be `1` mm or `2` mm).
     InvalidLod(u8),
-    /// Debounce time exceeds safe MCU limit (`0..=30` ms).
     InvalidDebounceMs(u8),
-    /// Sleep timeout not supported by firmware (`1, 3, 5, 10, 20, 30, 60` minutes).
     InvalidSleepMinutes(u8),
-    /// Safety lock: Primary Left Click cannot be unbound unless another button provides Left Click.
+    /// Prevents locking the user out of primary OS mouse interaction.
     NoPrimaryLeftClickAssigned,
-    /// Macro slot index exceeds `0..32`.
     InvalidMacroSlot(u8),
-    /// Compiled macro data exceeds the 4096-byte MCU flash partition.
-    MacroFlashOverflow { required: usize, capacity: usize },
+    MacroFlashOverflow {
+        required: usize,
+        capacity: usize,
+    },
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PacketTooShort { actual, expected_min } => {
-                write!(f, "packet too short ({actual} bytes, expected >= {expected_min})")
+            Self::PacketTooShort {
+                actual,
+                expected_min,
+            } => write!(
+                f,
+                "packet too short ({actual} bytes, expected >= {expected_min})"
+            ),
+            Self::InvalidMagicHeader(byte) => {
+                write!(f, "invalid packet magic header 0x{byte:02X}")
             }
-            Self::InvalidMagicHeader(b) => write!(f, "invalid packet magic header 0x{b:02X}"),
             Self::ChecksumMismatch => write!(f, "packet checksum verification failed"),
             Self::UnknownOpcode(op) => write!(f, "unknown YJX2012 opcode 0x{op:02X}"),
             Self::InvalidDpi { stage, value } => write!(
@@ -54,8 +56,13 @@ impl fmt::Display for ProtocolError {
                 "invalid PAW3311 DPI {value} on stage {} (must be {PAW3311_DPI_MIN}..={PAW3311_DPI_MAX} in steps of {PAW3311_DPI_STEP})",
                 stage + 1
             ),
-            Self::InvalidDpiCount(c) => write!(f, "invalid DPI stage count {c} (must be 1..=6)"),
-            Self::InvalidActiveDpiStage { active_index, count } => write!(
+            Self::InvalidDpiCount(count) => {
+                write!(f, "invalid DPI stage count {count} (must be 1..=6)")
+            }
+            Self::InvalidActiveDpiStage {
+                active_index,
+                count,
+            } => write!(
                 f,
                 "active DPI stage index {active_index} out of range for {count} enabled stages"
             ),
@@ -67,17 +74,26 @@ impl fmt::Display for ProtocolError {
                 write!(f, "invalid lift-off distance {mm} mm (supported: 1mm, 2mm)")
             }
             Self::InvalidDebounceMs(ms) => {
-                write!(f, "invalid debounce {ms} ms (must be 0..={MAX_DEBOUNCE_MS} ms)")
+                write!(
+                    f,
+                    "invalid debounce {ms} ms (must be 0..={MAX_DEBOUNCE_MS} ms)"
+                )
             }
             Self::InvalidSleepMinutes(min) => write!(
                 f,
                 "invalid sleep timeout {min} min (supported: 1, 3, 5, 10, 20, 30, 60 min)"
             ),
             Self::NoPrimaryLeftClickAssigned => {
-                write!(f, "at least one mouse button must remain mapped to Left Click")
+                write!(
+                    f,
+                    "at least one mouse button must remain mapped to Left Click"
+                )
             }
             Self::InvalidMacroSlot(slot) => {
-                write!(f, "invalid macro slot {slot} (must be 0..{MAX_MACRO_SLOTS})")
+                write!(
+                    f,
+                    "invalid macro slot {slot} (must be 0..{MAX_MACRO_SLOTS})"
+                )
             }
             Self::MacroFlashOverflow { required, capacity } => write!(
                 f,
@@ -87,12 +103,9 @@ impl fmt::Display for ProtocolError {
     }
 }
 
-/// Physical connection topology of the BK-R1X mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionMode {
-    /// USB-C Wired (`VID 0xA8A4`, `PID 0x2255`).
     UsbWired,
-    /// 2.4GHz Wireless Dongle (`VID 0xA8A5`, `PID 0x2255`).
     Wireless24Ghz,
 }
 
@@ -105,7 +118,6 @@ impl ConnectionMode {
     }
 }
 
-/// USB / 2.4GHz report polling rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PollingRate {
     Hz125,
@@ -137,7 +149,7 @@ impl PollingRate {
         }
     }
 
-    /// Converts to the 1-based wire byte (`1 = 125Hz, 2 = 250Hz, 3 = 500Hz, 4 = 1000Hz`).
+    /// Wire format encodes polling rate as `1..=4` (`report_rate_index + 1`).
     pub const fn to_wire_byte(self) -> u8 {
         match self {
             Self::Hz125 => 1,
@@ -147,9 +159,8 @@ impl PollingRate {
         }
     }
 
-    /// Decodes from the 1-based wire byte (`1..=4`), defaulting gracefully to `Hz1000` if out-of-range.
-    pub const fn from_wire_byte_lossy(b: u8) -> Self {
-        match b {
+    pub const fn from_wire_byte_lossy(byte: u8) -> Self {
+        match byte {
             1 => Self::Hz125,
             2 => Self::Hz250,
             3 => Self::Hz500,
@@ -158,7 +169,6 @@ impl PollingRate {
     }
 }
 
-/// PixArt PAW3311 Lift-Off Distance (LOD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LodHeight {
     #[default]
@@ -180,7 +190,6 @@ impl LodHeight {
     }
 }
 
-/// Scroll wheel direction setting (`scroll_flag` at `payload[48]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollDirection {
     #[default]
@@ -189,8 +198,8 @@ pub enum ScrollDirection {
 }
 
 impl ScrollDirection {
-    pub const fn from_wire(b: u8) -> Self {
-        if b == 1 {
+    pub const fn from_wire(byte: u8) -> Self {
+        if byte == 1 {
             Self::Reverse
         } else {
             Self::Normal
@@ -198,7 +207,6 @@ impl ScrollDirection {
     }
 }
 
-/// RGB / LED lighting mode (`light_mode` at `payload[9]` / `Opcode::SetLightMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum LightMode {
@@ -223,8 +231,8 @@ impl LightMode {
         Self::BreathingLoop,
     ];
 
-    pub const fn from_wire(b: u8) -> Self {
-        match b {
+    pub const fn from_wire(byte: u8) -> Self {
+        match byte {
             0 => Self::Off,
             1 => Self::Wave,
             2 => Self::Neon,
@@ -249,25 +257,19 @@ impl LightMode {
     }
 }
 
-/// PAW3311 linearity & smoothing register bitmask (`sensor_flag` at `payload[50]`).
-///
-/// Extracted bit positions from `app/page-51c144502f8589f3.js`:
-/// - `0x01` (`1`): Ripple Control (active above 9000 DPI)
-/// - `0x04` (`4`): Factory baseline bit (preserved across read-modify-write)
-/// - `0x10` (`16`): Angle Snapping / Linear Correction
-/// - `0x20` (`32`): Motion Sync
+/// PAW3311 DSP bitmask (`payload[50]`). Bit `0x04` is an undocumented OEM baseline bit
+/// (`default = 0x35`) that must be preserved across read-modify-write updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SensorFlags {
     pub ripple_control: bool,
     pub angle_snapping: bool,
     pub motion_sync: bool,
-    /// Preserves undocumented OEM baseline bits (e.g. `0x04` in default `0x35 = 53`).
     pub reserved_bits: u8,
 }
 
 impl Default for SensorFlags {
     fn default() -> Self {
-        Self::from_bits(53) // 0x35 = 0x20 | 0x10 | 0x04 | 0x01
+        Self::from_bits(0x35)
     }
 }
 
@@ -289,29 +291,27 @@ impl SensorFlags {
     }
 
     pub const fn to_bits(self) -> u8 {
-        let mut out = self.reserved_bits & !Self::KNOWN_MASK;
+        let mut bits = self.reserved_bits & !Self::KNOWN_MASK;
         if self.ripple_control {
-            out |= Self::BIT_RIPPLE_CONTROL;
+            bits |= Self::BIT_RIPPLE_CONTROL;
         }
         if self.angle_snapping {
-            out |= Self::BIT_ANGLE_SNAPPING;
+            bits |= Self::BIT_ANGLE_SNAPPING;
         }
         if self.motion_sync {
-            out |= Self::BIT_MOTION_SYNC;
+            bits |= Self::BIT_MOTION_SYNC;
         }
-        out
+        bits
     }
 }
 
-/// Supported MCU deep-sleep timeout presets in minutes (`1, 3, 5, 10, 20, 30, 60`).
 pub const VALID_SLEEP_MINUTES: [u8; 7] = [1, 3, 5, 10, 20, 30, 60];
 
-/// Complete PAW3311 + MCU configuration block corresponding to `0x0E` / `0x0F`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseConfig {
     pub dpi_stages: [u16; MAX_DPI_STAGES],
     pub dpi_count: u8,
-    /// 0-based active DPI stage (`0..dpi_count`).
+    /// Zero-based index into `dpi_stages` (`0..dpi_count`).
     pub active_dpi_stage: u8,
     pub polling_rate: PollingRate,
     pub lod: LodHeight,
@@ -332,12 +332,11 @@ impl Default for MouseConfig {
 }
 
 impl MouseConfig {
-    /// Exact factory configuration extracted from `getMouseConfigInfo` / `restoreFactorySettings`.
     pub const fn factory_default() -> Self {
         Self {
             dpi_stages: [800, 1200, 1600, 3200, 5000, 18000],
             dpi_count: 6,
-            active_dpi_stage: 2, // 1600 DPI (3rd stage)
+            active_dpi_stage: 2,
             polling_rate: PollingRate::Hz1000,
             lod: LodHeight::Mm1,
             debounce_ms: 2,
@@ -356,19 +355,18 @@ impl MouseConfig {
         }
     }
 
-    /// Returns the currently active DPI value in CPI/DPI.
     pub const fn active_dpi(&self) -> u16 {
-        let idx = if (self.active_dpi_stage as usize) < MAX_DPI_STAGES {
-            self.active_dpi_stage as usize
+        let stage_idx = self.active_dpi_stage as usize;
+        if stage_idx < MAX_DPI_STAGES {
+            self.dpi_stages[stage_idx]
         } else {
-            0
-        };
-        self.dpi_stages[idx]
+            self.dpi_stages[0]
+        }
     }
 
-    /// Strictly validates every field before flashing to MCU non-volatile memory.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.dpi_count == 0 || (self.dpi_count as usize) > MAX_DPI_STAGES {
+        let enabled_count = self.dpi_count as usize;
+        if enabled_count == 0 || enabled_count > MAX_DPI_STAGES {
             return Err(ProtocolError::InvalidDpiCount(self.dpi_count));
         }
         if self.active_dpi_stage >= self.dpi_count {
@@ -377,7 +375,7 @@ impl MouseConfig {
                 count: self.dpi_count,
             });
         }
-        for (stage, &dpi) in self.dpi_stages.iter().enumerate() {
+        for (stage, &dpi) in self.dpi_stages[..enabled_count].iter().enumerate() {
             validate_dpi(stage, dpi)?;
         }
         if self.debounce_ms > MAX_DEBOUNCE_MS {
@@ -390,7 +388,6 @@ impl MouseConfig {
     }
 }
 
-/// Validates a single PAW3311 DPI stage (`50..=18000`, step `50`).
 pub const fn validate_dpi(stage: usize, dpi: u16) -> Result<(), ProtocolError> {
     if dpi < PAW3311_DPI_MIN || dpi > PAW3311_DPI_MAX || !dpi.is_multiple_of(PAW3311_DPI_STEP) {
         Err(ProtocolError::InvalidDpi { stage, value: dpi })
@@ -399,7 +396,6 @@ pub const fn validate_dpi(stage: usize, dpi: u16) -> Result<(), ProtocolError> {
     }
 }
 
-/// Physical button & wheel binding slots (`0..8`) on the BK-R1X.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum ButtonSlot {
@@ -439,7 +435,6 @@ impl ButtonSlot {
     }
 }
 
-/// Standard HID mouse click bitmask (`type = 0x20`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MouseClickButton {
@@ -481,7 +476,6 @@ impl MouseClickButton {
     }
 }
 
-/// USB HID keyboard modifier bitmask (`code1` when `type = 0x10`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KeyModifiers(pub u8);
 
@@ -499,18 +493,20 @@ impl KeyModifiers {
     pub const fn has_ctrl(self) -> bool {
         (self.0 & (Self::LCTRL | Self::RCTRL)) != 0
     }
+
     pub const fn has_shift(self) -> bool {
         (self.0 & (Self::LSHIFT | Self::RSHIFT)) != 0
     }
+
     pub const fn has_alt(self) -> bool {
         (self.0 & (Self::LALT | Self::RALT)) != 0
     }
+
     pub const fn has_win(self) -> bool {
         (self.0 & (Self::LWIN | Self::RWIN)) != 0
     }
 }
 
-/// USB HID Consumer Control (`0x0C`) multimedia usages (`type = 0x30`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum MediaFunction {
@@ -556,8 +552,8 @@ impl MediaFunction {
         Self::WebFavorites,
     ];
 
-    pub const fn from_usage(u: u16) -> Option<Self> {
-        match u {
+    pub const fn from_usage(usage: u16) -> Option<Self> {
+        match usage {
             0x00E9 => Some(Self::VolumeUp),
             0x00EA => Some(Self::VolumeDown),
             0x00E2 => Some(Self::Mute),
@@ -604,44 +600,30 @@ impl MediaFunction {
     }
 }
 
-/// Hardware macro execution loop mode (`code3` when `type = 0x70`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MacroTrigger {
-    /// Replay the macro a fixed number of times (`1..=255`).
     FixedCount(u8),
-    /// Loop continuously while the button is held down (`code3 = 2`).
     #[default]
     HoldToLoop,
-    /// Loop continuously until any key/button is pressed again (`code3 = 3`).
     ToggleLoop,
 }
 
-/// 4-byte MCU button action descriptor (`[type, code1, code2, code3]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonAction {
-    /// Standard mouse click (`[0x20, mask, 0, 0]`).
     MouseClick(MouseClickButton),
-    /// Button disabled (`[0x20, 0, 0, 0]`).
     Disabled,
-    /// Scroll wheel up (`[0x21, 0x38, 0x01, 0x00]`).
     ScrollUp,
-    /// Scroll wheel down (`[0x21, 0x38, 0xFF, 0x00]`).
     ScrollDown,
-    /// Cycle active DPI stage (`[0x21, 0x55, 0x00, 0x00]`).
     DpiLoop,
-    /// Keyboard key or modifier + key combo (`[0x10, modifiers, hid_keycode, 0x00]`).
     KeyboardShortcut {
         modifiers: KeyModifiers,
         keycode: u8,
     },
-    /// Consumer multimedia key (`[0x30, usage_lo, usage_hi, 0x00]`).
     Media(MediaFunction),
-    /// Hardware macro slot execution (`[0x70, slot, repeat, trigger_mode]`).
     Macro {
         slot: u8,
         trigger: MacroTrigger,
     },
-    /// Raw preserved 4-byte vendor descriptor for forward compatibility.
     Raw([u8; 4]),
 }
 
@@ -667,27 +649,25 @@ impl ButtonAction {
         }
     }
 
-    pub const fn from_bytes(b: [u8; 4]) -> Self {
-        match b {
+    pub const fn from_bytes(bytes: [u8; 4]) -> Self {
+        match bytes {
             [0x20, 0x00, 0x00, 0x00] => Self::Disabled,
             [0x20, mask, 0x00, 0x00] => match MouseClickButton::from_mask(mask) {
                 Some(btn) => Self::MouseClick(btn),
-                None => Self::Raw(b),
+                None => Self::Raw(bytes),
             },
             [0x21, 0x38, 0x01, 0x00] => Self::ScrollUp,
             [0x21, 0x38, 0xFF, 0x00] => Self::ScrollDown,
+            // Factory firmware reports `[0xF0, 0x01, 0x01, 0x00]` on unprogrammed DPI-loop slots.
             [0x21, 0x55, 0x00, 0x00] | [0xF0, 0x01, 0x01, 0x00] => Self::DpiLoop,
-            [0x10, mods, key, 0x00] => Self::KeyboardShortcut {
+            [0x10, mods, keycode, 0x00] => Self::KeyboardShortcut {
                 modifiers: KeyModifiers(mods),
-                keycode: key,
+                keycode,
             },
-            [0x30, lo, hi, 0x00] => {
-                let usage = u16::from_le_bytes([lo, hi]);
-                match MediaFunction::from_usage(usage) {
-                    Some(m) => Self::Media(m),
-                    None => Self::Raw(b),
-                }
-            }
+            [0x30, lo, hi, 0x00] => match MediaFunction::from_usage(u16::from_le_bytes([lo, hi])) {
+                Some(func) => Self::Media(func),
+                None => Self::Raw(bytes),
+            },
             [0x70, slot, count, mode] => {
                 let trigger = match mode {
                     0x02 => MacroTrigger::HoldToLoop,
@@ -701,7 +681,6 @@ impl ButtonAction {
     }
 }
 
-/// Complete 8-slot button mapping table stored on the BK-R1X MCU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ButtonMapping {
     pub slots: [ButtonAction; BUTTON_SLOT_COUNT],
@@ -714,32 +693,33 @@ impl Default for ButtonMapping {
 }
 
 impl ButtonMapping {
+    pub const DEFAULT_SLOTS: [ButtonAction; BUTTON_SLOT_COUNT] = [
+        ButtonAction::MouseClick(MouseClickButton::Left),
+        ButtonAction::MouseClick(MouseClickButton::Right),
+        ButtonAction::MouseClick(MouseClickButton::Middle),
+        ButtonAction::MouseClick(MouseClickButton::Back),
+        ButtonAction::MouseClick(MouseClickButton::Forward),
+        ButtonAction::DpiLoop,
+        ButtonAction::ScrollUp,
+        ButtonAction::ScrollDown,
+    ];
+
     pub const fn factory_default() -> Self {
         Self {
-            slots: [
-                ButtonAction::MouseClick(MouseClickButton::Left),
-                ButtonAction::MouseClick(MouseClickButton::Right),
-                ButtonAction::MouseClick(MouseClickButton::Middle),
-                ButtonAction::MouseClick(MouseClickButton::Back),
-                ButtonAction::MouseClick(MouseClickButton::Forward),
-                ButtonAction::DpiLoop,
-                ButtonAction::ScrollUp,
-                ButtonAction::ScrollDown,
-            ],
+            slots: Self::DEFAULT_SLOTS,
         }
     }
 
-    /// Validates button assignments (ensures Left Click remains accessible and macro slots are in-bounds).
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        let has_left = self
+        let has_left_click = self
             .slots
             .iter()
-            .any(|a| matches!(a, ButtonAction::MouseClick(MouseClickButton::Left)));
-        if !has_left {
+            .any(|action| matches!(action, ButtonAction::MouseClick(MouseClickButton::Left)));
+        if !has_left_click {
             return Err(ProtocolError::NoPrimaryLeftClickAssigned);
         }
-        for action in &self.slots {
-            if let ButtonAction::Macro { slot, .. } = *action
+        for &action in &self.slots {
+            if let ButtonAction::Macro { slot, .. } = action
                 && (slot as usize) >= MAX_MACRO_SLOTS
             {
                 return Err(ProtocolError::InvalidMacroSlot(slot));
@@ -749,53 +729,48 @@ impl ButtonMapping {
     }
 }
 
-/// Single hardware macro action step (`4` bytes in MCU flash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroInput {
     MouseButton(MouseClickButton),
     KeyboardKey(u8),
 }
 
-/// A timed press or release event inside a hardware macro sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacroStep {
     pub input: MacroInput,
-    /// `true` = Press Down (`0x40` bit set), `false` = Release.
     pub pressed: bool,
-    /// Delay after this event in milliseconds (`0..=65535`).
     pub delay_ms: u16,
 }
 
 impl MacroStep {
-    /// Encodes a single 4-byte MCU macro record (`[delay_lo, delay_hi, flags, code]`).
+    /// MCU macro event binary layout: `[delay_lo, delay_hi, flags, hid_code]`.
+    /// `flags`: bit 6 (`0x40`) = key down, bit 7 (`0x80`) = end-of-macro marker.
     pub const fn encode(self, is_last: bool) -> [u8; 4] {
-        let [d_lo, d_hi] = self.delay_ms.to_le_bytes();
-        let (type_bits, code) = match self.input {
+        let [delay_lo, delay_hi] = self.delay_ms.to_le_bytes();
+        let (kind_bits, code) = match self.input {
             MacroInput::MouseButton(btn) => (0x03u8, btn as u8),
-            MacroInput::KeyboardKey(kc) => (0x02u8, kc),
+            MacroInput::KeyboardKey(keycode) => (0x02u8, keycode),
         };
-        let mut flags = type_bits;
+        let mut flags = kind_bits;
         if self.pressed {
             flags |= 0x40;
         }
         if is_last {
             flags |= 0x80;
         }
-        [d_lo, d_hi, flags, code]
+        [delay_lo, delay_hi, flags, code]
     }
 }
 
-/// Compiles up to 32 macro step slices into a caller-provided buffer (up to 4096 bytes),
-/// matching `eI()` in `bk-r1x.yjx2012.com` without heap allocations.
-///
-/// Returns the active byte length (`64..=4096`) to stream via `WriteMacroChunk` (`0x0D`).
 pub fn compile_macro_bank(
     macros: &[&[MacroStep]],
     out_flash: &mut [u8; MACRO_FLASH_TOTAL_LEN],
 ) -> Result<usize, ProtocolError> {
     if macros.len() > MAX_MACRO_SLOTS {
-        return Err(ProtocolError::InvalidMacroSlot(macros.len() as u8));
+        let reported_slot = u8::try_from(macros.len()).unwrap_or(u8::MAX);
+        return Err(ProtocolError::InvalidMacroSlot(reported_slot));
     }
+
     out_flash.fill(0);
     let mut cursor = MACRO_DIRECTORY_LEN;
 
@@ -803,20 +778,22 @@ pub fn compile_macro_bank(
         if steps.is_empty() {
             continue;
         }
-        let needed = steps.len() * 4;
-        if cursor + needed > MACRO_FLASH_TOTAL_LEN {
+        let byte_len = steps.len().saturating_mul(4);
+        let required = cursor.saturating_add(byte_len);
+        if required > MACRO_FLASH_TOTAL_LEN {
             return Err(ProtocolError::MacroFlashOverflow {
-                required: cursor + needed,
+                required,
                 capacity: MACRO_FLASH_TOTAL_LEN,
             });
         }
+
         let [off_lo, off_hi] = (cursor as u16).to_le_bytes();
         out_flash[slot_idx * 2] = off_lo;
         out_flash[slot_idx * 2 + 1] = off_hi;
 
-        for (i, step) in steps.iter().enumerate() {
-            let rec = step.encode(i + 1 == steps.len());
-            out_flash[cursor..cursor + 4].copy_from_slice(&rec);
+        let last_idx = steps.len() - 1;
+        for (step_idx, step) in steps.iter().enumerate() {
+            out_flash[cursor..cursor + 4].copy_from_slice(&step.encode(step_idx == last_idx));
             cursor += 4;
         }
     }
@@ -824,16 +801,12 @@ pub fn compile_macro_bank(
     Ok(cursor)
 }
 
-/// Battery telemetry reported by `0x30` or async `0xFA 0xD0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BatteryTelemetry {
-    /// Battery charge percentage (`0..=100`).
     pub percent: u8,
-    /// `true` when USB-C cable is actively charging the 500mAh LiPo cell.
     pub charging: bool,
 }
 
-/// ASCII semantic firmware version (`major.minor.patch`) reported by `0x03`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareVersion {
     pub major: u8,
@@ -843,10 +816,16 @@ pub struct FirmwareVersion {
 
 impl Default for FirmwareVersion {
     fn default() -> Self {
+        Self::new(1, 0, 0)
+    }
+}
+
+impl FirmwareVersion {
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
         Self {
-            major: 1,
-            minor: 0,
-            patch: 0,
+            major,
+            minor,
+            patch,
         }
     }
 }

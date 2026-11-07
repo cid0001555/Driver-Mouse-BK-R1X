@@ -1,7 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-//! `bkr1x-daemon` — Silent System Tray agent, sub-millisecond IPC server, and per-app profile
-//! switcher for the Fire Phoenix BK-R1X (`< 2 MB` background RSS, `0.0%` idle CPU).
 
+mod ipc_server;
 #[cfg(windows)]
 mod tray_win;
 
@@ -14,16 +13,17 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use bkr1x_hal::profile::{MacroProfileEntry, format_light_mode};
+use bkr1x_hal::profile::{MacroProfileEntry, decode_macro_entries, format_light_mode};
 #[cfg(windows)]
 use bkr1x_hal::send_ipc_request;
 use bkr1x_hal::{
-    Bkr1xDevice, DaemonStatusSnapshot, HardwareProfile, IpcRequest, IpcResponse, IpcWireTrace,
-    TraceDirection, ensure_user_profiles_dir,
+    Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
+    IpcWireTrace, TraceDirection, encode_hex_spaced, ensure_user_profiles_dir,
+    is_profile_extension,
 };
 use bkr1x_protocol::{
-    ButtonAction, ButtonMapping, HardwareStateMachine, MacroInput, MacroStep, MouseClickButton,
-    MouseConfig, PollingRate, ScrollDirection, validate_dpi,
+    ButtonAction, ButtonMapping, HardwareStateMachine, MacroStep, PollingRate, ScrollDirection,
+    validate_dpi,
 };
 
 pub(crate) enum DaemonCommand {
@@ -77,18 +77,18 @@ fn parse_cli_args() -> DaemonConfig {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--poll-secs" => {
-                if let Some(v) = args.next().and_then(|s| s.parse::<u64>().ok()) {
-                    poll_secs = v.max(5);
+                if let Some(secs) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    poll_secs = secs.max(5);
                 }
             }
             "--profiles-dir" => {
-                if let Some(p) = args.next() {
-                    profiles_dir = PathBuf::from(p);
+                if let Some(dir) = args.next() {
+                    profiles_dir = PathBuf::from(dir);
                 }
             }
             "--default-profile" => {
-                if let Some(p) = args.next() {
-                    default_profile_path = Some(PathBuf::from(p));
+                if let Some(path) = args.next() {
+                    default_profile_path = Some(PathBuf::from(path));
                 }
             }
             "--headless" => headless = true,
@@ -99,7 +99,7 @@ fn parse_cli_args() -> DaemonConfig {
 
     let default_profile = default_profile_path
         .as_deref()
-        .and_then(|p| HardwareProfile::load_from_file(p).ok());
+        .and_then(|path| HardwareProfile::load_from_file(path).ok());
 
     DaemonConfig {
         poll_interval: Duration::from_secs(poll_secs),
@@ -114,26 +114,17 @@ fn load_app_profiles(dir: &Path) -> Vec<HardwareProfile> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let is_cfg = p
-            .extension()
-            .and_then(|s| s.to_str())
-            .and_then(e_eq_cfg)
-            .unwrap_or(false);
-        if is_cfg
-            && let Ok(prof) = HardwareProfile::load_from_file(&p)
-            && prof.match_process.as_deref().is_some_and(|s| !s.trim().is_empty())
-        {
-            out.push(prof);
-        }
-    }
-    out
-}
-
-fn e_eq_cfg(ext: &str) -> Option<bool> {
-    Some(ext.eq_ignore_ascii_case("toml") || ext.eq_ignore_ascii_case("json"))
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_profile_extension(path))
+        .filter_map(|path| HardwareProfile::load_from_file(&path).ok())
+        .filter(|prof| {
+            prof.match_process
+                .as_deref()
+                .is_some_and(|pat| !pat.trim().is_empty())
+        })
+        .collect()
 }
 
 fn snapshot_from_device(
@@ -152,14 +143,14 @@ fn snapshot_from_device(
         None => (false, 0, 0, String::new(), fallback_state),
     };
     let cfg = &state.config;
-    let raw_buttons: [[u8; 4]; 8] = core::array::from_fn(|i| state.buttons.slots[i].to_bytes());
+    let raw_buttons: [[u8; 4]; 8] = core::array::from_fn(|idx| state.buttons.slots[idx].to_bytes());
 
     DaemonStatusSnapshot {
         connected,
         online: connected && state.online,
         connection_mode: state
             .connection
-            .map(|m| m.as_str().to_owned())
+            .map(|mode| mode.as_str().to_owned())
             .unwrap_or_else(|| "Disconnected".to_owned()),
         vendor_id: vid,
         product_id: pid,
@@ -168,8 +159,12 @@ fn snapshot_from_device(
         battery_percent: state.battery.percent,
         charging: state.battery.charging,
         active_dpi: cfg.active_dpi(),
-        active_dpi_stage: cfg.active_dpi_stage + 1,
-        dpi_stages: cfg.dpi_stages[..cfg.dpi_count as usize].to_vec(),
+        active_dpi_stage: cfg.active_dpi_stage.saturating_add(1),
+        dpi_stages: cfg
+            .dpi_stages
+            .get(..usize::from(cfg.dpi_count))
+            .unwrap_or(&cfg.dpi_stages)
+            .to_vec(),
         polling_rate_hz: cfg.polling_rate.as_hz(),
         lod_mm: cfg.lod.as_mm(),
         debounce_ms: cfg.debounce_ms,
@@ -188,30 +183,26 @@ fn snapshot_from_device(
 }
 
 fn collect_ipc_traces(dev: &mut Bkr1xDevice) -> Vec<IpcWireTrace> {
-    let out = dev
+    let checksum = dev.checksum_strategy();
+    let traces = dev
         .trace_log()
         .iter()
-        .map(|t| IpcWireTrace {
-            timestamp_unix_ms: t.timestamp_unix_ms,
-            is_out: t.direction == TraceDirection::Out,
-            report_id: t.report_id,
-            payload_hex: t
-                .payload
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-            summary: t.summary.clone(),
+        .map(|entry| IpcWireTrace {
+            timestamp_unix_ms: entry.timestamp_unix_ms,
+            is_out: entry.direction == TraceDirection::Out,
+            report_id: entry.report_id,
+            payload_hex: encode_hex_spaced(&entry.payload),
+            summary: entry.format_summary(checksum),
         })
         .collect();
     dev.clear_trace_log();
-    out
+    traces
 }
 
 fn apply_profile_to_device(
     dev: &mut Bkr1xDevice,
     prof: &HardwareProfile,
-) -> Result<(), bkr1x_hal::DeviceError> {
+) -> Result<(), DeviceError> {
     let cfg = prof.to_mouse_config()?;
     dev.write_config(&cfg)?;
     dev.write_light_mode(cfg.light_mode)?;
@@ -228,20 +219,40 @@ fn apply_profile_to_device(
 }
 
 #[cfg(windows)]
-fn acquire_single_instance_mutex() -> Option<isize> {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+struct SingleInstanceGuard(windows_sys::Win32::Foundation::HANDLE);
 
-    let name: Vec<u16> = "Local\\BKR1X_Daemon_SingleInstance"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        if h.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-            return None;
+#[cfg(windows)]
+impl SingleInstanceGuard {
+    fn acquire() -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let wide_name: Vec<u16> = "Local\\BKR1X_Daemon_SingleInstance"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: Creates or opens a per-session named Win32 mutex; duplicate handles are closed immediately.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, wide_name.as_ptr());
+            if handle.is_null() {
+                return None;
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
         }
-        Some(h as isize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid Win32 mutex handle owned exclusively by this guard.
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 
@@ -249,24 +260,20 @@ fn main() {
     let cfg = parse_cli_args();
 
     #[cfg(windows)]
-    let _single_instance_guard = match acquire_single_instance_mutex() {
-        Some(guard) => guard,
-        None => {
-            if !cfg.silent_if_running {
-                let _ = send_ipc_request(&IpcRequest::OpenGui);
-            }
-            return;
+    let Some(_instance_guard) = SingleInstanceGuard::acquire() else {
+        if !cfg.silent_if_running {
+            let _ = send_ipc_request(&IpcRequest::OpenGui);
         }
+        return;
     };
+    #[cfg(not(windows))]
+    let _ = cfg.silent_if_running;
 
     let running = Arc::new(AtomicBool::new(true));
-    let initial_state = HardwareStateMachine {
-        config: MouseConfig::factory_default(),
-        ..HardwareStateMachine::default()
-    };
+    let fallback_state = HardwareStateMachine::new();
     let shared_snapshot = Arc::new(RwLock::new(snapshot_from_device(
         None,
-        &initial_state,
+        &fallback_state,
         None,
     )));
 
@@ -275,17 +282,16 @@ fn main() {
     #[cfg(windows)]
     let tray_notifier = tray_win::TrayNotifier::default();
 
-    // 1. Spawn minimal 64 KiB-stack IPC listener thread
     let ipc_snapshot = Arc::clone(&shared_snapshot);
     let ipc_running = Arc::clone(&running);
     let ipc_tx = cmd_tx.clone();
     #[cfg(windows)]
     let ipc_tray = tray_notifier.clone();
-    let _ipc_handle = thread::Builder::new()
+    let Ok(_ipc_handle) = thread::Builder::new()
         .name("bkr1x-ipc".to_owned())
         .stack_size(64 * 1024)
         .spawn(move || {
-            run_ipc_listener(
+            ipc_server::run_ipc_listener(
                 ipc_snapshot,
                 ipc_tx,
                 ipc_running,
@@ -293,21 +299,24 @@ fn main() {
                 ipc_tray,
             )
         })
-        .expect("failed to spawn IPC listener thread");
+    else {
+        return;
+    };
 
-    // 2. Run hardware loop + optional Win32 System Tray host
     #[cfg(windows)]
     if !cfg.headless {
         let hw_snapshot = Arc::clone(&shared_snapshot);
         let hw_running = Arc::clone(&running);
         let hw_tray = tray_notifier.clone();
-        let _hw_handle = thread::Builder::new()
+        let Ok(_hw_handle) = thread::Builder::new()
             .name("bkr1x-hw".to_owned())
             .stack_size(128 * 1024)
             .spawn(move || {
                 hardware_event_loop(cfg, hw_snapshot, cmd_rx, hw_running, Some(hw_tray));
             })
-            .expect("failed to spawn hardware thread");
+        else {
+            return;
+        };
 
         tray_win::run_system_tray_loop(tray_notifier, shared_snapshot, cmd_tx, running);
         return;
@@ -323,6 +332,120 @@ fn main() {
     );
 }
 
+struct LoopContext {
+    device: Option<Bkr1xDevice>,
+    fallback_state: HardwareStateMachine,
+    shared_snapshot: Arc<RwLock<DaemonStatusSnapshot>>,
+    active_profile_name: Option<String>,
+    #[cfg(windows)]
+    tray: Option<tray_win::TrayNotifier>,
+}
+
+impl LoopContext {
+    fn notify_tray(&self) {
+        #[cfg(windows)]
+        if let Some(ref tray) = self.tray {
+            tray.notify_state_changed();
+        }
+    }
+
+    fn publish_snapshot(&self) {
+        if let Ok(mut guard) = self.shared_snapshot.write() {
+            *guard = snapshot_from_device(
+                self.device.as_ref(),
+                &self.fallback_state,
+                self.active_profile_name.as_deref(),
+            );
+        }
+    }
+
+    fn cloned_boxed_snapshot(&self) -> Option<Box<DaemonStatusSnapshot>> {
+        self.shared_snapshot
+            .read()
+            .ok()
+            .map(|guard| Box::new(guard.clone()))
+    }
+
+    fn ensure_connected(&mut self, sync_on_open: bool) -> Result<&mut Bkr1xDevice, DeviceError> {
+        if self.device.is_none() {
+            let mut dev = Bkr1xDevice::open_auto()?;
+            if sync_on_open {
+                let _ = dev.sync_all();
+            }
+            self.device = Some(dev);
+        }
+        self.device.as_mut().ok_or(DeviceError::NotFound)
+    }
+
+    fn run_device_mutation<F>(
+        &mut self,
+        sync_on_open: bool,
+        refresh_tray: bool,
+        mutate: F,
+    ) -> IpcResponse
+    where
+        F: FnOnce(&mut Bkr1xDevice, &mut Option<String>) -> Result<String, DeviceError>,
+    {
+        let mut new_profile = self.active_profile_name.clone();
+        let outcome = self
+            .ensure_connected(sync_on_open)
+            .and_then(|dev| mutate(dev, &mut new_profile));
+
+        match outcome {
+            Ok(message) => {
+                self.active_profile_name = new_profile;
+                self.publish_snapshot();
+                if refresh_tray {
+                    self.notify_tray();
+                }
+                let traces = self.device.as_mut().map(collect_ipc_traces);
+                IpcResponse::Ok {
+                    snapshot: self.cloned_boxed_snapshot(),
+                    traces,
+                    message: Some(message),
+                }
+            }
+            Err(err) => {
+                if matches!(err, DeviceError::Hid(_)) {
+                    self.device = None;
+                    self.publish_snapshot();
+                    self.notify_tray();
+                }
+                IpcResponse::Error {
+                    message: err.to_string(),
+                }
+            }
+        }
+    }
+
+    fn poll_hardware_once(&mut self) {
+        if self.device.is_none() {
+            match Bkr1xDevice::open_auto() {
+                Ok(mut dev) => {
+                    let _ = dev.sync_all();
+                    self.device = Some(dev);
+                    self.publish_snapshot();
+                }
+                Err(_) => self.publish_snapshot(),
+            }
+            return;
+        }
+
+        let mut disconnected = false;
+        if let Some(dev) = self.device.as_mut() {
+            match dev.poll_battery(Duration::from_secs(5)) {
+                Ok(_) => self.publish_snapshot(),
+                Err(DeviceError::Hid(_)) => disconnected = true,
+                Err(_) => {}
+            }
+        }
+        if disconnected {
+            self.device = None;
+            self.publish_snapshot();
+        }
+    }
+}
+
 fn hardware_event_loop(
     cfg: DaemonConfig,
     shared_snapshot: Arc<RwLock<DaemonStatusSnapshot>>,
@@ -331,27 +454,21 @@ fn hardware_event_loop(
     #[cfg(windows)] tray: Option<tray_win::TrayNotifier>,
 ) {
     let mut app_profiles = load_app_profiles(&cfg.profiles_dir);
-    let mut device: Option<Bkr1xDevice> = None;
-    let mut active_profile_name: Option<String> = None;
     let mut saved_desktop_baseline: Option<HardwareProfile> = None;
     let mut in_auto_game_profile = false;
     let mut last_foreground_exe = String::new();
-    let fallback_state = HardwareStateMachine::default();
 
-    let notify_tray = || {
+    let mut ctx = LoopContext {
+        device: None,
+        fallback_state: HardwareStateMachine::new(),
+        shared_snapshot,
+        active_profile_name: None,
         #[cfg(windows)]
-        if let Some(ref t) = tray {
-            t.notify_state_changed();
-        }
+        tray,
     };
 
-    poll_hardware_once(
-        &mut device,
-        &fallback_state,
-        &shared_snapshot,
-        active_profile_name.as_deref(),
-    );
-    notify_tray();
+    ctx.poll_hardware_once();
+    ctx.notify_tray();
 
     let mut elapsed_since_battery = Duration::ZERO;
 
@@ -366,8 +483,8 @@ fn hardware_event_loop(
             Ok(DaemonCommand::Shutdown) => {
                 running.store(false, Ordering::SeqCst);
                 #[cfg(windows)]
-                if let Some(ref t) = tray {
-                    t.request_quit();
+                if let Some(ref tray) = ctx.tray {
+                    tray.request_quit();
                 }
                 break;
             }
@@ -375,312 +492,113 @@ fn hardware_event_loop(
                 app_profiles = load_app_profiles(&cfg.profiles_dir);
             }
             Ok(DaemonCommand::GetFullState { reply }) => {
-                if device.is_none() {
-                    poll_hardware_once(
-                        &mut device,
-                        &fallback_state,
-                        &shared_snapshot,
-                        active_profile_name.as_deref(),
-                    );
-                    notify_tray();
+                if ctx.device.is_none() {
+                    ctx.poll_hardware_once();
+                    ctx.notify_tray();
                 }
-                let traces = device.as_mut().map(collect_ipc_traces);
-                let snap = shared_snapshot.read().ok().map(|g| g.clone());
+                let traces = ctx.device.as_mut().map(collect_ipc_traces);
                 let _ = reply.send(IpcResponse::Ok {
-                    snapshot: snap,
+                    snapshot: ctx.cloned_boxed_snapshot(),
                     traces,
                     message: None,
                 });
             }
             Ok(DaemonCommand::Refresh { reply }) => {
-                if let Some(dev) = device.as_mut() {
+                if let Some(dev) = ctx.device.as_mut() {
                     let _ = dev.sync_all();
-                    if let Ok(mut guard) = shared_snapshot.write() {
-                        *guard = snapshot_from_device(
-                            Some(dev),
-                            &fallback_state,
-                            active_profile_name.as_deref(),
-                        );
-                    }
+                    ctx.publish_snapshot();
                 } else {
-                    poll_hardware_once(
-                        &mut device,
-                        &fallback_state,
-                        &shared_snapshot,
-                        active_profile_name.as_deref(),
-                    );
+                    ctx.poll_hardware_once();
                 }
-                notify_tray();
-                let traces = device.as_mut().map(collect_ipc_traces);
-                let snap = shared_snapshot.read().ok().map(|g| g.clone());
+                ctx.notify_tray();
+                let traces = ctx.device.as_mut().map(collect_ipc_traces);
                 let _ = reply.send(IpcResponse::Ok {
-                    snapshot: snap,
+                    snapshot: ctx.cloned_boxed_snapshot(),
                     traces,
                     message: Some("Hardware telemetry refreshed".to_owned()),
                 });
                 elapsed_since_battery = Duration::ZERO;
             }
             Ok(DaemonCommand::SetQuickDpi { dpi, reply }) => {
-                if device.is_none() {
-                    device = Bkr1xDevice::open_auto().ok();
-                    if let Some(dev) = device.as_mut() {
-                        let _ = dev.sync_all();
+                let resp = ctx.run_device_mutation(true, true, |dev, _| {
+                    let mut mcfg = dev.state().config;
+                    let active_idx = usize::from(mcfg.active_dpi_stage);
+                    validate_dpi(active_idx, dpi)?;
+                    let enabled_stages = mcfg
+                        .dpi_stages
+                        .get(..usize::from(mcfg.dpi_count))
+                        .unwrap_or(&mcfg.dpi_stages);
+                    if let Some(idx) = enabled_stages
+                        .iter()
+                        .position(|&stage_dpi| stage_dpi == dpi)
+                    {
+                        mcfg.active_dpi_stage = idx as u8;
+                    } else if let Some(slot) = mcfg.dpi_stages.get_mut(active_idx) {
+                        *slot = dpi;
                     }
-                }
-                let resp = match device.as_mut() {
-                    Some(dev) => {
-                        let mut mcfg = dev.state().config;
-                        if let Err(e) = validate_dpi(mcfg.active_dpi_stage as usize, dpi) {
-                            IpcResponse::Error {
-                                message: e.to_string(),
-                            }
-                        } else {
-                            if let Some(idx) = mcfg.dpi_stages[..mcfg.dpi_count as usize]
-                                .iter()
-                                .position(|&d| d == dpi)
-                            {
-                                mcfg.active_dpi_stage = idx as u8;
-                            } else {
-                                mcfg.dpi_stages[mcfg.active_dpi_stage as usize] = dpi;
-                            }
-                            match dev.write_config(&mcfg) {
-                                Ok(()) => {
-                                    update_shared(
-                                        Some(dev),
-                                        &fallback_state,
-                                        &shared_snapshot,
-                                        active_profile_name.as_deref(),
-                                    );
-                                    notify_tray();
-                                    IpcResponse::Ok {
-                                        snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-                                        traces: Some(collect_ipc_traces(dev)),
-                                        message: Some(format!("Switched to {dpi} DPI")),
-                                    }
-                                }
-                                Err(e) => IpcResponse::Error {
-                                    message: e.to_string(),
-                                },
-                            }
-                        }
-                    }
-                    None => IpcResponse::Error {
-                        message: bkr1x_hal::DeviceError::NotFound.to_string(),
-                    },
-                };
+                    dev.write_config(&mcfg)?;
+                    Ok(format!("Switched to {dpi} DPI"))
+                });
                 let _ = reply.send(resp);
             }
             Ok(DaemonCommand::SetQuickRate { rate_hz, reply }) => {
-                if device.is_none() {
-                    device = Bkr1xDevice::open_auto().ok();
-                    if let Some(dev) = device.as_mut() {
-                        let _ = dev.sync_all();
-                    }
-                }
-                let resp = match (device.as_mut(), PollingRate::from_hz(rate_hz)) {
-                    (Some(dev), Ok(rate)) => {
-                        let mut mcfg = dev.state().config;
-                        mcfg.polling_rate = rate;
-                        match dev.write_config(&mcfg) {
-                            Ok(()) => {
-                                update_shared(
-                                    Some(dev),
-                                    &fallback_state,
-                                    &shared_snapshot,
-                                    active_profile_name.as_deref(),
-                                );
-                                notify_tray();
-                                IpcResponse::Ok {
-                                    snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-                                    traces: Some(collect_ipc_traces(dev)),
-                                    message: Some(format!("Switched polling rate to {rate_hz} Hz")),
-                                }
-                            }
-                            Err(e) => IpcResponse::Error {
-                                message: e.to_string(),
-                            },
-                        }
-                    }
-                    (_, Err(e)) => IpcResponse::Error {
-                        message: e.to_string(),
-                    },
-                    (None, _) => IpcResponse::Error {
-                        message: bkr1x_hal::DeviceError::NotFound.to_string(),
-                    },
-                };
+                let resp = ctx.run_device_mutation(true, true, |dev, _| {
+                    let rate = PollingRate::from_hz(rate_hz)?;
+                    let mut mcfg = dev.state().config;
+                    mcfg.polling_rate = rate;
+                    dev.write_config(&mcfg)?;
+                    Ok(format!("Switched polling rate to {rate_hz} Hz"))
+                });
                 let _ = reply.send(resp);
             }
             Ok(DaemonCommand::FlashButtons { raw_slots, reply }) => {
-                if device.is_none() {
-                    device = Bkr1xDevice::open_auto().ok();
-                }
-                let mapping = ButtonMapping {
-                    slots: core::array::from_fn(|i| ButtonAction::from_bytes(raw_slots[i])),
-                };
-                let resp = match device.as_mut() {
-                    Some(dev) => match dev.write_buttons(&mapping) {
-                        Ok(()) => {
-                            update_shared(
-                                Some(dev),
-                                &fallback_state,
-                                &shared_snapshot,
-                                active_profile_name.as_deref(),
-                            );
-                            IpcResponse::Ok {
-                                snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-                                traces: Some(collect_ipc_traces(dev)),
-                                message: Some("Flashed 8-slot button map to BK-R1X.".to_owned()),
-                            }
-                        }
-                        Err(e) => IpcResponse::Error {
-                            message: e.to_string(),
-                        },
-                    },
-                    None => IpcResponse::Error {
-                        message: bkr1x_hal::DeviceError::NotFound.to_string(),
-                    },
-                };
+                let resp = ctx.run_device_mutation(false, false, |dev, _| {
+                    let mapping = ButtonMapping {
+                        slots: core::array::from_fn(|idx| ButtonAction::from_bytes(raw_slots[idx])),
+                    };
+                    dev.write_buttons(&mapping)?;
+                    Ok("Flashed 8-slot button map to BK-R1X.".to_owned())
+                });
                 let _ = reply.send(resp);
             }
             Ok(DaemonCommand::FlashMacros { macros, reply }) => {
-                if device.is_none() {
-                    device = Bkr1xDevice::open_auto().ok();
-                }
-                let resp = match device.as_mut() {
-                    Some(dev) => match decode_ipc_macros(&macros) {
-                        Ok(vecs) => {
-                            let slices: Vec<&[MacroStep]> =
-                                vecs.iter().map(Vec::as_slice).collect();
-                            match dev.write_macros(&slices) {
-                                Ok(bytes) => IpcResponse::Ok {
-                                    snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-                                    traces: Some(collect_ipc_traces(dev)),
-                                    message: Some(format!(
-                                        "Flashed {bytes} bytes of hardware macros to MCU."
-                                    )),
-                                },
-                                Err(e) => IpcResponse::Error {
-                                    message: e.to_string(),
-                                },
-                            }
-                        }
-                        Err(msg) => IpcResponse::Error { message: msg },
-                    },
-                    None => IpcResponse::Error {
-                        message: bkr1x_hal::DeviceError::NotFound.to_string(),
-                    },
-                };
+                let resp = ctx.run_device_mutation(false, false, |dev, _| {
+                    let vecs = decode_macro_entries(&macros)?;
+                    let slices: Vec<&[MacroStep]> = vecs.iter().map(Vec::as_slice).collect();
+                    let bytes = dev.write_macros(&slices)?;
+                    Ok(format!("Flashed {bytes} bytes of hardware macros to MCU."))
+                });
                 let _ = reply.send(resp);
             }
             Ok(DaemonCommand::ApplyProfile { profile, reply }) => {
-                if device.is_none() {
-                    device = Bkr1xDevice::open_auto().ok();
-                }
-                let resp = match device.as_mut() {
-                    Some(dev) => match apply_profile_to_device(dev, &profile) {
-                        Ok(()) => {
-                            active_profile_name = Some(profile.name.clone());
-                            update_shared(
-                                Some(dev),
-                                &fallback_state,
-                                &shared_snapshot,
-                                active_profile_name.as_deref(),
-                            );
-                            notify_tray();
-                            IpcResponse::Ok {
-                                snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-                                traces: Some(collect_ipc_traces(dev)),
-                                message: Some(format!("Applied profile '{}'", profile.name)),
-                            }
-                        }
-                        Err(e) => IpcResponse::Error {
-                            message: e.to_string(),
-                        },
-                    },
-                    None => IpcResponse::Error {
-                        message: bkr1x_hal::DeviceError::NotFound.to_string(),
-                    },
-                };
+                let resp = ctx.run_device_mutation(false, true, |dev, active_name| {
+                    apply_profile_to_device(dev, &profile)?;
+                    *active_name = Some(profile.name.clone());
+                    Ok(format!("Applied profile '{}'", profile.name))
+                });
                 let _ = reply.send(resp);
             }
             Err(RecvTimeoutError::Timeout) => {
                 elapsed_since_battery += wait_quantum;
 
-                if !app_profiles.is_empty()
-                    && let Some(fg) = query_foreground_process_name()
-                    && !fg.eq_ignore_ascii_case(&last_foreground_exe)
-                {
-                    last_foreground_exe = fg.clone();
-                    let matched = app_profiles.iter().find(|p| {
-                        p.match_process.as_deref().is_some_and(|pat| {
-                            fg.to_ascii_lowercase().contains(&pat.to_ascii_lowercase())
-                        })
-                    });
-
-                    if let Some(game_prof) = matched {
-                        if active_profile_name.as_deref() != Some(game_prof.name.as_str())
-                            && let Some(dev) = device.as_mut()
-                        {
-                            if !in_auto_game_profile {
-                                saved_desktop_baseline = Some(HardwareProfile::from_hardware(
-                                    "Desktop Baseline",
-                                    &dev.state().config,
-                                    &dev.state().buttons,
-                                ));
-                            }
-                            if apply_profile_to_device(dev, game_prof).is_ok() {
-                                in_auto_game_profile = true;
-                                active_profile_name = Some(game_prof.name.clone());
-                                update_shared(
-                                    Some(dev),
-                                    &fallback_state,
-                                    &shared_snapshot,
-                                    active_profile_name.as_deref(),
-                                );
-                                notify_tray();
-                            }
-                        }
-                    } else if in_auto_game_profile {
-                        let revert = cfg
-                            .default_profile
-                            .as_ref()
-                            .or(saved_desktop_baseline.as_ref());
-                        if let Some(base_prof) = revert
-                            && let Some(dev) = device.as_mut()
-                            && apply_profile_to_device(dev, base_prof).is_ok()
-                        {
-                            in_auto_game_profile = false;
-                            active_profile_name = cfg.default_profile.as_ref().map(|p| p.name.clone());
-                            update_shared(
-                                Some(dev),
-                                &fallback_state,
-                                &shared_snapshot,
-                                active_profile_name.as_deref(),
-                            );
-                            notify_tray();
-                        }
-                    }
-                }
+                handle_foreground_profile_switch(
+                    &mut ctx,
+                    &cfg,
+                    &app_profiles,
+                    &mut last_foreground_exe,
+                    &mut saved_desktop_baseline,
+                    &mut in_auto_game_profile,
+                );
 
                 if elapsed_since_battery >= cfg.poll_interval {
-                    poll_hardware_once(
-                        &mut device,
-                        &fallback_state,
-                        &shared_snapshot,
-                        active_profile_name.as_deref(),
-                    );
-                    notify_tray();
+                    ctx.poll_hardware_once();
+                    ctx.notify_tray();
                     elapsed_since_battery = Duration::ZERO;
-                } else if let Some(dev) = device.as_mut()
+                } else if let Some(dev) = ctx.device.as_mut()
                     && dev.drain_async_events() > 0
                 {
-                    update_shared(
-                        Some(dev),
-                        &fallback_state,
-                        &shared_snapshot,
-                        active_profile_name.as_deref(),
-                    );
-                    notify_tray();
+                    ctx.publish_snapshot();
+                    ctx.notify_tray();
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -693,319 +611,79 @@ fn hardware_event_loop(
     }
 }
 
-fn update_shared(
-    dev: Option<&Bkr1xDevice>,
-    fallback: &HardwareStateMachine,
-    shared: &Arc<RwLock<DaemonStatusSnapshot>>,
-    active_profile: Option<&str>,
+fn handle_foreground_profile_switch(
+    ctx: &mut LoopContext,
+    cfg: &DaemonConfig,
+    app_profiles: &[HardwareProfile],
+    last_foreground_exe: &mut String,
+    saved_desktop_baseline: &mut Option<HardwareProfile>,
+    in_auto_game_profile: &mut bool,
 ) {
-    if let Ok(mut guard) = shared.write() {
-        *guard = snapshot_from_device(dev, fallback, active_profile);
+    if app_profiles.is_empty() {
+        return;
     }
-}
-
-fn decode_ipc_macros(entries: &[MacroProfileEntry]) -> Result<Vec<Vec<MacroStep>>, String> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let mut seq = Vec::with_capacity(entry.steps.len());
-        for s in &entry.steps {
-            let input = if s.kind.eq_ignore_ascii_case("mouse") {
-                let btn = MouseClickButton::from_mask(s.code)
-                    .ok_or_else(|| format!("invalid mouse button code {}", s.code))?;
-                MacroInput::MouseButton(btn)
-            } else {
-                MacroInput::KeyboardKey(s.code)
-            };
-            seq.push(MacroStep {
-                input,
-                pressed: s.pressed,
-                delay_ms: s.delay_ms,
-            });
-        }
-        out.push(seq);
-    }
-    Ok(out)
-}
-
-fn poll_hardware_once(
-    device: &mut Option<Bkr1xDevice>,
-    fallback_state: &HardwareStateMachine,
-    shared_snapshot: &Arc<RwLock<DaemonStatusSnapshot>>,
-    active_profile: Option<&str>,
-) {
-    if device.is_none() {
-        match Bkr1xDevice::open_auto() {
-            Ok(mut dev) => {
-                let _ = dev.sync_all();
-                update_shared(Some(&dev), fallback_state, shared_snapshot, active_profile);
-                *device = Some(dev);
-                return;
-            }
-            Err(_) => {
-                if let Ok(mut guard) = shared_snapshot.write() {
-                    guard.connected = false;
-                    guard.online = false;
-                    guard.connection_mode = "Disconnected".to_owned();
-                }
-                return;
-            }
-        }
-    }
-
-    let mut disconnected = false;
-    if let Some(dev) = device.as_mut() {
-        match dev.poll_battery(Duration::from_secs(5)) {
-            Ok(_) => {
-                update_shared(Some(dev), fallback_state, shared_snapshot, active_profile);
-            }
-            Err(bkr1x_hal::DeviceError::Hid(_)) => {
-                disconnected = true;
-            }
-            Err(_) => {}
-        }
-    }
-
-    if disconnected {
-        *device = None;
-        if let Ok(mut guard) = shared_snapshot.write() {
-            guard.connected = false;
-            guard.online = false;
-            guard.connection_mode = "Disconnected".to_owned();
-        }
-    }
-}
-
-fn handle_ipc_line(
-    line: &str,
-    shared_snapshot: &Arc<RwLock<DaemonStatusSnapshot>>,
-    cmd_tx: &Sender<DaemonCommand>,
-    running: &Arc<AtomicBool>,
-    #[cfg(windows)] tray: &tray_win::TrayNotifier,
-) -> IpcResponse {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        let snap = shared_snapshot.read().ok().map(|g| g.clone());
-        return IpcResponse::Ok {
-            snapshot: snap,
-            traces: None,
-            message: None,
-        };
-    }
-
-    let req: IpcRequest = match serde_json::from_str(trimmed) {
-        Ok(r) => r,
-        Err(e) => {
-            return IpcResponse::Error {
-                message: format!("invalid JSON request: {e}"),
-            };
-        }
-    };
-
-    let dispatch_sync = |make_cmd: Box<dyn FnOnce(SyncSender<IpcResponse>) -> DaemonCommand>| {
-        let (tx, rx) = mpsc::sync_channel(1);
-        if cmd_tx.send(make_cmd(tx)).is_err() {
-            return IpcResponse::Error {
-                message: "daemon shutting down".to_owned(),
-            };
-        }
-        rx.recv_timeout(Duration::from_secs(5))
-            .unwrap_or(IpcResponse::Error {
-                message: "hardware command timed out".to_owned(),
-            })
-    };
-
-    match req {
-        IpcRequest::Status => IpcResponse::Ok {
-            snapshot: shared_snapshot.read().ok().map(|g| g.clone()),
-            traces: None,
-            message: None,
-        },
-        IpcRequest::GetFullState => {
-            dispatch_sync(Box::new(|reply| DaemonCommand::GetFullState { reply }))
-        }
-        IpcRequest::Refresh => dispatch_sync(Box::new(|reply| DaemonCommand::Refresh { reply })),
-        IpcRequest::SetQuickDpi { dpi } => {
-            dispatch_sync(Box::new(move |reply| DaemonCommand::SetQuickDpi {
-                dpi,
-                reply,
-            }))
-        }
-        IpcRequest::SetQuickRate { rate_hz } => {
-            dispatch_sync(Box::new(move |reply| DaemonCommand::SetQuickRate {
-                rate_hz,
-                reply,
-            }))
-        }
-        IpcRequest::FlashButtons { raw_slots } => {
-            dispatch_sync(Box::new(move |reply| DaemonCommand::FlashButtons {
-                raw_slots,
-                reply,
-            }))
-        }
-        IpcRequest::FlashMacros { macros } => {
-            dispatch_sync(Box::new(move |reply| DaemonCommand::FlashMacros {
-                macros,
-                reply,
-            }))
-        }
-        IpcRequest::ApplyProfile { profile } => {
-            dispatch_sync(Box::new(move |reply| DaemonCommand::ApplyProfile {
-                profile,
-                reply,
-            }))
-        }
-        IpcRequest::ReloadProfiles => {
-            let _ = cmd_tx.send(DaemonCommand::ReloadProfiles);
-            IpcResponse::Ok {
-                snapshot: None,
-                traces: None,
-                message: Some("reloaded profiles".to_owned()),
-            }
-        }
-        IpcRequest::OpenGui => {
-            #[cfg(windows)]
-            tray.request_open_gui();
-            IpcResponse::Ok {
-                snapshot: None,
-                traces: None,
-                message: Some("opened configurator".to_owned()),
-            }
-        }
-        IpcRequest::Shutdown => {
-            running.store(false, Ordering::SeqCst);
-            let _ = cmd_tx.send(DaemonCommand::Shutdown);
-            #[cfg(windows)]
-            tray.request_quit();
-            IpcResponse::Ok {
-                snapshot: None,
-                traces: None,
-                message: Some("shutting down".to_owned()),
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn run_ipc_listener(
-    shared_snapshot: Arc<RwLock<DaemonStatusSnapshot>>,
-    cmd_tx: Sender<DaemonCommand>,
-    running: Arc<AtomicBool>,
-) {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-
-    let sock_path = bkr1x_hal::unix_socket_path();
-    let _ = fs::remove_file(&sock_path);
-    let Ok(listener) = UnixListener::bind(&sock_path) else {
+    let Some(fg_exe) = query_foreground_process_name() else {
         return;
     };
-    let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    if fg_exe.eq_ignore_ascii_case(last_foreground_exe) {
+        return;
+    }
+    *last_foreground_exe = fg_exe.clone();
 
-    for stream_res in listener.incoming() {
-        if !running.load(Ordering::Relaxed) {
-            break;
+    let matched = app_profiles.iter().find(|prof| {
+        prof.match_process
+            .as_deref()
+            .is_some_and(|pat| contains_ignore_ascii_case(&fg_exe, pat.trim()))
+    });
+
+    if let Some(game_prof) = matched {
+        if ctx.active_profile_name.as_deref() == Some(game_prof.name.as_str()) {
+            return;
         }
-        if let Ok(mut stream) = stream_res {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let mut line = String::new();
-            if let Ok(cloned) = stream.try_clone() {
-                let mut reader = BufReader::new(cloned);
-                let _ = reader.read_line(&mut line);
-            }
-            let resp = handle_ipc_line(&line, &shared_snapshot, &cmd_tx, &running);
-            if let Ok(mut json) = serde_json::to_string(&resp) {
-                json.push('\n');
-                let _ = stream.write_all(json.as_bytes());
-                let _ = stream.flush();
-            }
+        let Some(dev) = ctx.device.as_mut() else {
+            return;
+        };
+        if !*in_auto_game_profile {
+            *saved_desktop_baseline = Some(HardwareProfile::from_hardware(
+                "Desktop Baseline",
+                &dev.state().config,
+                &dev.state().buttons,
+            ));
         }
+        if apply_profile_to_device(dev, game_prof).is_ok() {
+            *in_auto_game_profile = true;
+            ctx.active_profile_name = Some(game_prof.name.clone());
+            ctx.publish_snapshot();
+            ctx.notify_tray();
+        }
+        return;
+    }
+
+    if !*in_auto_game_profile {
+        return;
+    }
+    let Some(base_prof) = cfg
+        .default_profile
+        .as_ref()
+        .or(saved_desktop_baseline.as_ref())
+    else {
+        return;
+    };
+    let Some(dev) = ctx.device.as_mut() else {
+        return;
+    };
+    if apply_profile_to_device(dev, base_prof).is_ok() {
+        *in_auto_game_profile = false;
+        ctx.active_profile_name = cfg.default_profile.as_ref().map(|p| p.name.clone());
+        ctx.publish_snapshot();
+        ctx.notify_tray();
     }
 }
 
-#[cfg(windows)]
-fn run_ipc_listener(
-    shared_snapshot: Arc<RwLock<DaemonStatusSnapshot>>,
-    cmd_tx: Sender<DaemonCommand>,
-    running: Arc<AtomicBool>,
-    tray: tray_win::TrayNotifier,
-) {
-    use bkr1x_hal::ipc::WINDOWS_NAMED_PIPE;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
-    };
-    use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-    };
-
-    let wide_name: Vec<u16> = WINDOWS_NAMED_PIPE
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    while running.load(Ordering::Relaxed) {
-        let pipe = unsafe {
-            CreateNamedPipeW(
-                wide_name.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                16384,
-                16384,
-                500,
-                std::ptr::null(),
-            )
-        };
-        if pipe == INVALID_HANDLE_VALUE {
-            thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-
-        let connected = unsafe { ConnectNamedPipe(pipe, std::ptr::null_mut()) != 0 }
-            || unsafe { GetLastError() == ERROR_PIPE_CONNECTED };
-
-        if connected {
-            let mut buf = [0u8; 16384];
-            let mut bytes_read = 0u32;
-            let ok = unsafe {
-                ReadFile(
-                    pipe,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    &mut bytes_read,
-                    std::ptr::null_mut(),
-                ) != 0
-            };
-            if ok || bytes_read > 0 {
-                let req_str = String::from_utf8_lossy(&buf[..bytes_read as usize]);
-                let first_line = req_str.lines().next().unwrap_or("");
-                let resp = handle_ipc_line(first_line, &shared_snapshot, &cmd_tx, &running, &tray);
-                if let Ok(mut out) = serde_json::to_string(&resp) {
-                    out.push('\n');
-                    let mut written = 0u32;
-                    unsafe {
-                        let _ = WriteFile(
-                            pipe,
-                            out.as_ptr(),
-                            out.len() as u32,
-                            &mut written,
-                            std::ptr::null_mut(),
-                        );
-                        let _ = FlushFileBuffers(pipe);
-                    }
-                }
-            }
-        }
-
-        unsafe {
-            let _ = DisconnectNamedPipe(pipe);
-            let _ = CloseHandle(pipe);
-        }
-    }
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    !n.is_empty() && h.windows(n.len()).any(|win| win.eq_ignore_ascii_case(n))
 }
 
 #[cfg(windows)]
@@ -1018,6 +696,7 @@ fn query_foreground_process_name() -> Option<String> {
         GetForegroundWindow, GetWindowThreadProcessId,
     };
 
+    // SAFETY: Queries read-only image path of the foreground window's PID and closes `proc_handle`.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
@@ -1039,8 +718,8 @@ fn query_foreground_process_name() -> Option<String> {
         if ok == 0 || len == 0 {
             return None;
         }
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        Path::new(&full)
+        let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+        Path::new(&full_path)
             .file_name()
             .and_then(|s| s.to_str())
             .map(str::to_owned)

@@ -1,27 +1,17 @@
-//! Hardware, transport, IPC, and profile errors for `bkr1x-hal`.
-
 use std::fmt;
 
 use bkr1x_protocol::ProtocolError;
 
-/// Unified error type returned by `bkr1x-hal` operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceError {
-    /// Neither USB-C Wired (`0xA8A4:0x2255`) nor 2.4GHz Dongle (`0xA8A5:0x2255`) was found.
     NotFound,
-    /// Mouse is connected via Bluetooth HOGP only (standard mouse HID present, vendor `0xFF01` interface absent).
+    /// Bluetooth HOGP omits the vendor `0xFF01` configuration collection; settings require USB-C or 2.4GHz.
     BluetoothConfigUnsupported,
-    /// 2.4GHz Wireless receiver is enumerated, but the mouse MCU is currently in deep sleep or powered off.
     MouseAsleep,
-    /// Read timed out (`150ms`) waiting for MCU response.
     Timeout,
-    /// Underlying `hidapi` (`hidraw` / `hid.dll`) error.
     Hid(String),
-    /// Packet framing, checksum, or PAW3311 hardware bounds validation error.
     Protocol(ProtocolError),
-    /// Background daemon IPC transport error.
     Ipc(String),
-    /// Profile TOML/JSON parsing or IO error.
     Profile(String),
 }
 

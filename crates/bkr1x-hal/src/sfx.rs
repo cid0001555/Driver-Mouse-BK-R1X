@@ -1,11 +1,7 @@
-//! Self-Extracting (SFX) deflate bundle encoder & decoder for single-file GitHub Release installers.
-//!
-//! Appends compressed `bkr1x-daemon.exe`, `bkr1x-gui.exe`, and `bkr1x-cli.exe` binaries onto
-//! the compiled `bkr1x-installer.exe` PE stub followed by a 26-byte verified trailer:
-//! - `payload_offset: u64 LE` (exact length of original PE stub—used to write a tiny `Uninstall BK-R1X.exe`!)
-//! - `payload_len: u64 LE`
-//! - `crc16_ccitt: u16 LE`
-//! - `magic: [u8; 8]` (`*b"BKR1XSFX"`)
+//! Self-extracting (SFX) archive trailer appended to `bkr1x-installer.exe`:
+//! `[PE stub][zlib entries][stub_len: u64 LE][payload_len: u64 LE][crc16: u16 LE]["BKR1XSFX"]`.
+//! Storing `stub_len` lets the installer slice out its own clean PE stub as `Uninstall BK-R1X.exe`
+//! without duplicating the multi-megabyte compressed payload on disk.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -16,45 +12,42 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
-/// 8-byte EOF signature identifying a self-contained BK-R1X Setup Wizard binary.
 pub const SFX_FOOTER_MAGIC: [u8; 8] = *b"BKR1XSFX";
 const SFX_FOOTER_LEN: usize = 26;
 
-/// Extracted self-contained installer bundle.
 #[derive(Debug, Clone)]
 pub struct SfxBundle {
-    /// Exact byte length of the clean PE installer stub (excluding the appended archive).
     pub stub_len: u64,
-    /// Decompressed `(filename, bytes)` entries.
     pub files: Vec<(String, Vec<u8>)>,
 }
 
-/// Packs `stub_exe` + `entries` (`(filename, raw_bytes)`) into a single self-extracting `.exe`.
 pub fn pack_sfx_installer(stub_exe: &[u8], entries: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
-    let count = u32::try_from(entries.len()).map_err(|_| "too many SFX files".to_owned())?;
-    payload.extend_from_slice(&count.to_le_bytes());
+    let entry_count =
+        u32::try_from(entries.len()).map_err(|_| "too many SFX archive entries".to_owned())?;
+    payload.extend_from_slice(&entry_count.to_le_bytes());
 
-    for (name, raw) in entries {
+    for &(name, raw_bytes) in entries {
         let name_bytes = name.as_bytes();
         let name_len =
             u16::try_from(name_bytes.len()).map_err(|_| format!("filename '{name}' too long"))?;
         let raw_len =
-            u32::try_from(raw.len()).map_err(|_| format!("entry '{name}' exceeds 4 GiB"))?;
+            u32::try_from(raw_bytes.len()).map_err(|_| format!("entry '{name}' exceeds 4 GiB"))?;
 
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
-        enc.write_all(raw)
-            .map_err(|e| format!("deflate failed for '{name}': {e}"))?;
-        let compressed = enc
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(raw_bytes)
+            .map_err(|e| format!("deflate write failed for '{name}': {e}"))?;
+        let compressed = encoder
             .finish()
             .map_err(|e| format!("deflate finish failed for '{name}': {e}"))?;
-        let comp_len = u32::try_from(compressed.len())
+        let compressed_len = u32::try_from(compressed.len())
             .map_err(|_| format!("compressed '{name}' exceeds 4 GiB"))?;
 
         payload.extend_from_slice(&name_len.to_le_bytes());
         payload.extend_from_slice(name_bytes);
         payload.extend_from_slice(&raw_len.to_le_bytes());
-        payload.extend_from_slice(&comp_len.to_le_bytes());
+        payload.extend_from_slice(&compressed_len.to_le_bytes());
         payload.extend_from_slice(&compressed);
     }
 
@@ -62,22 +55,20 @@ pub fn pack_sfx_installer(stub_exe: &[u8], entries: &[(&str, &[u8])]) -> Result<
     let payload_len = payload.len() as u64;
     let crc = ChecksumStrategy::crc16_ccitt(&payload);
 
-    let mut out = Vec::with_capacity(stub_exe.len() + payload.len() + SFX_FOOTER_LEN);
-    out.extend_from_slice(stub_exe);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(&stub_len.to_le_bytes());
-    out.extend_from_slice(&payload_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&SFX_FOOTER_MAGIC);
-    Ok(out)
+    let mut image = Vec::with_capacity(stub_exe.len() + payload.len() + SFX_FOOTER_LEN);
+    image.extend_from_slice(stub_exe);
+    image.extend_from_slice(&payload);
+    image.extend_from_slice(&stub_len.to_le_bytes());
+    image.extend_from_slice(&payload_len.to_le_bytes());
+    image.extend_from_slice(&crc.to_le_bytes());
+    image.extend_from_slice(&SFX_FOOTER_MAGIC);
+    Ok(image)
 }
 
-/// Inspects `exe_path` for an appended `BKR1XSFX` trailer and decompresses all embedded files.
-/// Returns `Ok(None)` if `exe_path` is a bare PE stub without an appended bundle.
 pub fn extract_sfx_from_exe(exe_path: &Path) -> Result<Option<SfxBundle>, String> {
-    let mut f = fs::File::open(exe_path)
+    let mut file = fs::File::open(exe_path)
         .map_err(|e| format!("failed opening {}: {e}", exe_path.display()))?;
-    let total_len = f
+    let total_len = file
         .metadata()
         .map_err(|e| format!("metadata failed: {e}"))?
         .len();
@@ -85,32 +76,35 @@ pub fn extract_sfx_from_exe(exe_path: &Path) -> Result<Option<SfxBundle>, String
         return Ok(None);
     }
 
-    f.seek(SeekFrom::End(-(SFX_FOOTER_LEN as i64)))
+    file.seek(SeekFrom::End(-(SFX_FOOTER_LEN as i64)))
         .map_err(|e| format!("seek footer failed: {e}"))?;
     let mut footer = [0u8; SFX_FOOTER_LEN];
-    f.read_exact(&mut footer)
+    file.read_exact(&mut footer)
         .map_err(|e| format!("read footer failed: {e}"))?;
 
-    if footer[18..26] != SFX_FOOTER_MAGIC {
+    let (header_bytes, magic) = footer.split_at(18);
+    if magic != SFX_FOOTER_MAGIC {
         return Ok(None);
     }
 
-    let stub_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-    let payload_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-    let expected_crc = u16::from_le_bytes(footer[16..18].try_into().unwrap());
+    let mut cursor = ByteCursor::new(header_bytes);
+    let stub_len = cursor.read_u64_le()?;
+    let payload_len = cursor.read_u64_le()?;
+    let expected_crc = cursor.read_u16_le()?;
 
-    if stub_len
+    let expected_total = stub_len
         .checked_add(payload_len)
-        .and_then(|n| n.checked_add(SFX_FOOTER_LEN as u64))
-        != Some(total_len)
-    {
+        .and_then(|sum| sum.checked_add(SFX_FOOTER_LEN as u64));
+    if expected_total != Some(total_len) {
         return Err("corrupted SFX archive (size mismatch in trailer)".to_owned());
     }
 
-    f.seek(SeekFrom::Start(stub_len))
+    let payload_cap = usize::try_from(payload_len)
+        .map_err(|_| "SFX archive payload exceeds addressable memory".to_owned())?;
+    file.seek(SeekFrom::Start(stub_len))
         .map_err(|e| format!("seek payload failed: {e}"))?;
-    let mut payload = vec![0u8; payload_len as usize];
-    f.read_exact(&mut payload)
+    let mut payload = vec![0u8; payload_cap];
+    file.read_exact(&mut payload)
         .map_err(|e| format!("read payload failed: {e}"))?;
 
     let actual_crc = ChecksumStrategy::crc16_ccitt(&payload);
@@ -120,40 +114,27 @@ pub fn extract_sfx_from_exe(exe_path: &Path) -> Result<Option<SfxBundle>, String
         ));
     }
 
-    let files = decode_payload_slice(&payload)?;
+    let files = decode_payload_entries(&payload)?;
     Ok(Some(SfxBundle { stub_len, files }))
 }
 
-fn decode_payload_slice(buf: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
-    if buf.len() < 4 {
-        return Err("truncated SFX header".to_owned());
-    }
-    let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-    let mut pos = 4usize;
-    let mut out = Vec::with_capacity(count);
+fn decode_payload_entries(buf: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut cursor = ByteCursor::new(buf);
+    let entry_count = cursor.read_u32_le()? as usize;
+    let mut entries = Vec::with_capacity(entry_count.min(32));
 
-    for _ in 0..count {
-        if pos + 2 > buf.len() {
-            return Err("truncated SFX filename length".to_owned());
-        }
-        let name_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        if pos + name_len + 8 > buf.len() {
-            return Err("truncated SFX entry header".to_owned());
-        }
-        let name = std::str::from_utf8(&buf[pos..pos + name_len])
+    for _ in 0..entry_count {
+        let name_len = cursor.read_u16_le()? as usize;
+        let name_bytes = cursor.read_slice(name_len)?;
+        let name = std::str::from_utf8(name_bytes)
             .map_err(|e| format!("invalid UTF-8 filename in SFX: {e}"))?
             .to_owned();
-        pos += name_len;
 
-        let raw_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        let comp_len = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
+        let raw_len = cursor.read_u32_le()? as usize;
+        let compressed_len = cursor.read_u32_le()? as usize;
+        let compressed_bytes = cursor.read_slice(compressed_len)?;
 
-        if pos + comp_len > buf.len() {
-            return Err(format!("truncated compressed stream for '{name}'"));
-        }
-        let mut decoder = ZlibDecoder::new(&buf[pos..pos + comp_len]);
+        let mut decoder = ZlibDecoder::new(compressed_bytes);
         let mut decompressed = Vec::with_capacity(raw_len);
         decoder
             .read_to_end(&mut decompressed)
@@ -164,9 +145,49 @@ fn decode_payload_slice(buf: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
                 decompressed.len()
             ));
         }
-        pos += comp_len;
-        out.push((name, decompressed));
+        entries.push((name, decompressed));
     }
 
-    Ok(out)
+    Ok(entries)
+}
+
+struct ByteCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ByteCursor<'a> {
+    const fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| "SFX archive offset overflow".to_owned())?;
+        let slice = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| "truncated SFX archive payload".to_owned())?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_u16_le(&mut self) -> Result<u16, String> {
+        let bytes = self.read_slice(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32_le(&mut self) -> Result<u32, String> {
+        let bytes = self.read_slice(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64_le(&mut self) -> Result<u64, String> {
+        let bytes = self.read_slice(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
 }

@@ -1,18 +1,37 @@
-//! Human-readable TOML / JSON hardware profile serialization and validation.
-
 use std::fs;
 use std::path::Path;
 
 use bkr1x_protocol::{
-    ButtonAction, ButtonMapping, KeyModifiers, LightMode, LodHeight, MacroInput, MacroStep,
-    MacroTrigger, MediaFunction, MouseClickButton, MouseConfig, PollingRate, ScrollDirection,
-    SensorFlags,
+    ButtonAction, ButtonMapping, KeyModifiers, LightMode, LodHeight, MAX_DPI_STAGES, MacroInput,
+    MacroStep, MacroTrigger, MediaFunction, MouseClickButton, MouseConfig, PollingRate,
+    ScrollDirection, SensorFlags,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::DeviceError;
+use crate::hex::decode_flexible_hex;
 
-/// Serializable hardware profile loadable from `.toml` or `.json`.
+const MEDIA_SPEC_TABLE: [(MediaFunction, &str); 18] = [
+    (MediaFunction::VolumeUp, "media:vol_up"),
+    (MediaFunction::VolumeDown, "media:vol_down"),
+    (MediaFunction::Mute, "media:mute"),
+    (MediaFunction::PlayPause, "media:play_pause"),
+    (MediaFunction::Stop, "media:stop"),
+    (MediaFunction::PrevTrack, "media:prev"),
+    (MediaFunction::NextTrack, "media:next"),
+    (MediaFunction::MediaPlayer, "media:player"),
+    (MediaFunction::Mail, "media:mail"),
+    (MediaFunction::Calculator, "media:calculator"),
+    (MediaFunction::MyComputer, "media:my_computer"),
+    (MediaFunction::WebSearch, "media:web_search"),
+    (MediaFunction::WebHome, "media:web_home"),
+    (MediaFunction::WebBack, "media:web_back"),
+    (MediaFunction::WebForward, "media:web_forward"),
+    (MediaFunction::WebStop, "media:web_stop"),
+    (MediaFunction::WebRefresh, "media:web_refresh"),
+    (MediaFunction::WebFavorites, "media:web_favorites"),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareProfile {
     #[serde(default = "default_profile_name")]
@@ -35,7 +54,7 @@ fn default_profile_name() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorSection {
     pub dpi_stages: Vec<u16>,
-    /// 1-based active DPI stage (`1..=6`).
+    /// One-based active stage index (`1..=6`).
     pub active_stage: u8,
     pub polling_rate_hz: u16,
     pub lod_mm: u8,
@@ -53,13 +72,13 @@ pub struct SensorSection {
 pub struct PowerLightingSection {
     pub sleep_minutes: u8,
     pub light_mode: String,
-    #[serde(default = "bool_true")]
+    #[serde(default = "default_true")]
     pub wakeup_on_move: bool,
-    #[serde(default = "bool_true")]
+    #[serde(default = "default_true")]
     pub move_lights_off: bool,
 }
 
-fn bool_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -99,10 +118,7 @@ fn default_scroll_down() -> ButtonBindingSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ButtonBindingSpec {
-    /// Shorthand string such as `"left"`, `"right"`, `"middle"`, `"back"`, `"forward"`,
-    /// `"dpi_loop"`, `"scroll_up"`, `"scroll_down"`, `"disabled"`, `"media:play_pause"`, `"media:vol_up"`.
     Simple(String),
-    /// Structured keyboard shortcut or hardware macro trigger.
     Structured {
         kind: String,
         #[serde(default)]
@@ -126,26 +142,18 @@ pub struct MacroProfileEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MacroStepSpec {
-    /// `"key"` or `"mouse"`.
     pub kind: String,
-    /// USB HID keycode (e.g. `4` for `A`) or mouse button (`1=L, 2=R, 4=M, 8=Back, 16=Fwd`).
     pub code: u8,
     pub pressed: bool,
     pub delay_ms: u16,
 }
 
 impl HardwareProfile {
-    /// Loads a `.toml` or `.json` profile from disk and validates all PAW3311 constraints.
     pub fn load_from_file(path: &Path) -> Result<Self, DeviceError> {
         let raw = fs::read_to_string(path)
             .map_err(|e| DeviceError::Profile(format!("failed reading {}: {e}", path.display())))?;
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("toml")
-            .to_ascii_lowercase();
 
-        let profile: Self = if ext == "json" {
+        let profile: Self = if is_json_extension(path) {
             serde_json::from_str(&raw)
                 .map_err(|e| DeviceError::Profile(format!("invalid JSON profile: {e}")))?
         } else {
@@ -157,37 +165,29 @@ impl HardwareProfile {
         Ok(profile)
     }
 
-    /// Saves this profile to `.toml` or `.json` based on file extension.
     pub fn save_to_file(&self, path: &Path) -> Result<(), DeviceError> {
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("toml")
-            .to_ascii_lowercase();
-
-        let text = if ext == "json" {
+        let serialized = if is_json_extension(path) {
             serde_json::to_string_pretty(self)
                 .map_err(|e| DeviceError::Profile(format!("JSON serialize error: {e}")))?
         } else {
             toml::to_string_pretty(self)
                 .map_err(|e| DeviceError::Profile(format!("TOML serialize error: {e}")))?
         };
-        fs::write(path, text)
+        fs::write(path, serialized)
             .map_err(|e| DeviceError::Profile(format!("failed writing {}: {e}", path.display())))
     }
 
-    /// Builds a [`HardwareProfile`] from live MCU state.
     pub fn from_hardware(
         name: impl Into<String>,
         cfg: &MouseConfig,
         buttons: &ButtonMapping,
     ) -> Self {
-        let stages = cfg.dpi_stages[..cfg.dpi_count as usize].to_vec();
+        let stage_count = (cfg.dpi_count as usize).min(MAX_DPI_STAGES);
         Self {
             name: name.into(),
             match_process: None,
             sensor: SensorSection {
-                dpi_stages: stages,
+                dpi_stages: cfg.dpi_stages[..stage_count].to_vec(),
                 active_stage: cfg.active_dpi_stage + 1,
                 polling_rate_hz: cfg.polling_rate.as_hz(),
                 lod_mm: cfg.lod.as_mm(),
@@ -218,16 +218,16 @@ impl HardwareProfile {
         }
     }
 
-    /// Converts and strictly validates the PAW3311 [`MouseConfig`].
     pub fn to_mouse_config(&self) -> Result<MouseConfig, DeviceError> {
-        if self.sensor.dpi_stages.is_empty() || self.sensor.dpi_stages.len() > 6 {
+        if self.sensor.dpi_stages.is_empty() || self.sensor.dpi_stages.len() > MAX_DPI_STAGES {
             return Err(DeviceError::Profile(
                 "sensor.dpi_stages must contain 1..=6 DPI stages".to_owned(),
             ));
         }
+
         let mut dpi_stages = MouseConfig::factory_default().dpi_stages;
-        for (i, &val) in self.sensor.dpi_stages.iter().enumerate() {
-            dpi_stages[i] = val;
+        for (idx, &dpi) in self.sensor.dpi_stages.iter().enumerate() {
+            dpi_stages[idx] = dpi;
         }
         let dpi_count = self.sensor.dpi_stages.len() as u8;
         if self.sensor.active_stage == 0 || self.sensor.active_stage > dpi_count {
@@ -265,7 +265,6 @@ impl HardwareProfile {
         Ok(cfg)
     }
 
-    /// Converts and validates the 8-slot [`ButtonMapping`].
     pub fn to_button_mapping(&self) -> Result<ButtonMapping, DeviceError> {
         let Some(ref b) = self.buttons else {
             return Ok(ButtonMapping::factory_default());
@@ -286,59 +285,81 @@ impl HardwareProfile {
         Ok(mapping)
     }
 
-    /// Compiles optional profile macro entries into [`MacroStep`] vectors.
     pub fn to_macro_vecs(&self) -> Result<Vec<Vec<MacroStep>>, DeviceError> {
-        let mut out = Vec::with_capacity(self.macros.len());
-        for entry in &self.macros {
-            let mut seq = Vec::with_capacity(entry.steps.len());
-            for step in &entry.steps {
-                let input = match step.kind.to_ascii_lowercase().as_str() {
-                    "mouse" => {
-                        let btn = MouseClickButton::from_mask(step.code).ok_or_else(|| {
-                            DeviceError::Profile(format!(
-                                "invalid mouse button mask {} in macro '{}'",
-                                step.code, entry.name
-                            ))
-                        })?;
-                        MacroInput::MouseButton(btn)
-                    }
-                    "key" | "keyboard" => MacroInput::KeyboardKey(step.code),
-                    other => {
-                        return Err(DeviceError::Profile(format!(
-                            "unknown macro step kind '{other}' in macro '{}'",
-                            entry.name
-                        )));
-                    }
-                };
-                seq.push(MacroStep {
-                    input,
-                    pressed: step.pressed,
-                    delay_ms: step.delay_ms,
-                });
-            }
-            out.push(seq);
+        decode_macro_entries(&self.macros)
+    }
+}
+
+pub fn decode_macro_entries(
+    entries: &[MacroProfileEntry],
+) -> Result<Vec<Vec<MacroStep>>, DeviceError> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut seq = Vec::with_capacity(entry.steps.len());
+        for step in &entry.steps {
+            let input = if step.kind.eq_ignore_ascii_case("mouse") {
+                let btn = MouseClickButton::from_mask(step.code).ok_or_else(|| {
+                    DeviceError::Profile(format!(
+                        "invalid mouse button mask {} in macro '{}'",
+                        step.code, entry.name
+                    ))
+                })?;
+                MacroInput::MouseButton(btn)
+            } else if step.kind.eq_ignore_ascii_case("key")
+                || step.kind.eq_ignore_ascii_case("keyboard")
+            {
+                MacroInput::KeyboardKey(step.code)
+            } else {
+                return Err(DeviceError::Profile(format!(
+                    "unknown macro step kind '{}' in macro '{}'",
+                    step.kind, entry.name
+                )));
+            };
+            seq.push(MacroStep {
+                input,
+                pressed: step.pressed,
+                delay_ms: step.delay_ms,
+            });
         }
-        Ok(out)
+        out.push(seq);
     }
+    Ok(out)
 }
 
-pub fn parse_light_mode(s: &str) -> Result<LightMode, DeviceError> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "off" | "0" => Ok(LightMode::Off),
-        "wave" | "1" => Ok(LightMode::Wave),
-        "neon" | "2" => Ok(LightMode::Neon),
-        "flash" | "cycling_flash" | "3" => Ok(LightMode::CyclingFlash),
-        "yoyo" | "yoyo_ball" | "4" => Ok(LightMode::YoyoBall),
-        "single" | "single_flash" | "5" => Ok(LightMode::SingleFlash),
-        "breathing" | "breathing_loop" | "6" => Ok(LightMode::BreathingLoop),
-        other => Err(DeviceError::Profile(format!(
-            "unknown light_mode '{other}' (expected off, wave, neon, flash, yoyo, single, breathing)"
-        ))),
-    }
+fn is_json_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
-pub fn format_light_mode(m: LightMode) -> &'static str {
-    match m {
+pub fn parse_light_mode(raw: &str) -> Result<LightMode, DeviceError> {
+    let trimmed = raw.trim();
+    for (mode, names) in [
+        (LightMode::Off, &["off", "0"][..]),
+        (LightMode::Wave, &["wave", "1"]),
+        (LightMode::Neon, &["neon", "2"]),
+        (LightMode::CyclingFlash, &["flash", "cycling_flash", "3"]),
+        (LightMode::YoyoBall, &["yoyo", "yoyo_ball", "4"]),
+        (LightMode::SingleFlash, &["single", "single_flash", "5"]),
+        (
+            LightMode::BreathingLoop,
+            &["breathing", "breathing_loop", "6"],
+        ),
+    ] {
+        if names
+            .iter()
+            .any(|candidate| trimmed.eq_ignore_ascii_case(candidate))
+        {
+            return Ok(mode);
+        }
+    }
+    Err(DeviceError::Profile(format!(
+        "unknown light_mode '{trimmed}' (expected off, wave, neon, flash, yoyo, single, breathing)"
+    )))
+}
+
+pub const fn format_light_mode(mode: LightMode) -> &'static str {
+    match mode {
         LightMode::Off => "off",
         LightMode::Wave => "wave",
         LightMode::Neon => "neon",
@@ -351,27 +372,7 @@ pub fn format_light_mode(m: LightMode) -> &'static str {
 
 fn parse_action_spec(spec: &ButtonBindingSpec) -> Result<ButtonAction, DeviceError> {
     match spec {
-        ButtonBindingSpec::Simple(s) => match s.trim().to_ascii_lowercase().as_str() {
-            "left" | "left_click" => Ok(ButtonAction::MouseClick(MouseClickButton::Left)),
-            "right" | "right_click" => Ok(ButtonAction::MouseClick(MouseClickButton::Right)),
-            "middle" | "middle_click" => Ok(ButtonAction::MouseClick(MouseClickButton::Middle)),
-            "back" | "backward" => Ok(ButtonAction::MouseClick(MouseClickButton::Back)),
-            "forward" => Ok(ButtonAction::MouseClick(MouseClickButton::Forward)),
-            "dpi" | "dpi_loop" => Ok(ButtonAction::DpiLoop),
-            "scroll_up" => Ok(ButtonAction::ScrollUp),
-            "scroll_down" => Ok(ButtonAction::ScrollDown),
-            "disabled" | "none" => Ok(ButtonAction::Disabled),
-            "media:vol_up" => Ok(ButtonAction::Media(MediaFunction::VolumeUp)),
-            "media:vol_down" => Ok(ButtonAction::Media(MediaFunction::VolumeDown)),
-            "media:mute" => Ok(ButtonAction::Media(MediaFunction::Mute)),
-            "media:play_pause" => Ok(ButtonAction::Media(MediaFunction::PlayPause)),
-            "media:next" => Ok(ButtonAction::Media(MediaFunction::NextTrack)),
-            "media:prev" => Ok(ButtonAction::Media(MediaFunction::PrevTrack)),
-            "media:calculator" => Ok(ButtonAction::Media(MediaFunction::Calculator)),
-            other => Err(DeviceError::Profile(format!(
-                "unknown button binding '{other}'"
-            ))),
-        },
+        ButtonBindingSpec::Simple(raw) => parse_simple_action(raw.trim()),
         ButtonBindingSpec::Structured {
             kind,
             modifiers,
@@ -379,40 +380,111 @@ fn parse_action_spec(spec: &ButtonBindingSpec) -> Result<ButtonAction, DeviceErr
             macro_slot,
             repeat,
             loop_mode,
-        } => match kind.to_ascii_lowercase().as_str() {
-            "shortcut" | "key" => {
-                let mut mask = 0u8;
-                for m in modifiers {
-                    match m.to_ascii_lowercase().as_str() {
-                        "ctrl" | "lctrl" => mask |= KeyModifiers::LCTRL,
-                        "shift" | "lshift" => mask |= KeyModifiers::LSHIFT,
-                        "alt" | "lalt" => mask |= KeyModifiers::LALT,
-                        "win" | "super" | "lgui" => mask |= KeyModifiers::LWIN,
-                        "rctrl" => mask |= KeyModifiers::RCTRL,
-                        "rshift" => mask |= KeyModifiers::RSHIFT,
-                        "ralt" => mask |= KeyModifiers::RALT,
-                        _ => {}
-                    }
-                }
-                Ok(ButtonAction::KeyboardShortcut {
+        } => {
+            if kind.eq_ignore_ascii_case("shortcut") || kind.eq_ignore_ascii_case("key") {
+                let mask = parse_modifier_list(modifiers);
+                return Ok(ButtonAction::KeyboardShortcut {
                     modifiers: KeyModifiers(mask),
                     keycode: keycode.unwrap_or(0),
-                })
+                });
             }
-            "macro" => {
+            if kind.eq_ignore_ascii_case("macro") {
                 let slot = macro_slot.unwrap_or(0);
-                let trigger = match loop_mode.as_deref().unwrap_or("fixed") {
-                    "hold" => MacroTrigger::HoldToLoop,
-                    "toggle" => MacroTrigger::ToggleLoop,
-                    _ => MacroTrigger::FixedCount(repeat.unwrap_or(1).max(1)),
+                let mode = loop_mode.as_deref().unwrap_or("fixed");
+                let trigger = if mode.eq_ignore_ascii_case("hold") {
+                    MacroTrigger::HoldToLoop
+                } else if mode.eq_ignore_ascii_case("toggle") {
+                    MacroTrigger::ToggleLoop
+                } else {
+                    MacroTrigger::FixedCount(repeat.unwrap_or(1).max(1))
                 };
-                Ok(ButtonAction::Macro { slot, trigger })
+                return Ok(ButtonAction::Macro { slot, trigger });
             }
-            other => Err(DeviceError::Profile(format!(
-                "unknown structured button kind '{other}'"
-            ))),
-        },
+            Err(DeviceError::Profile(format!(
+                "unknown structured button kind '{kind}'"
+            )))
+        }
     }
+}
+
+fn parse_simple_action(token: &str) -> Result<ButtonAction, DeviceError> {
+    for (action, aliases) in [
+        (
+            ButtonAction::MouseClick(MouseClickButton::Left),
+            &["left", "left_click"][..],
+        ),
+        (
+            ButtonAction::MouseClick(MouseClickButton::Right),
+            &["right", "right_click"],
+        ),
+        (
+            ButtonAction::MouseClick(MouseClickButton::Middle),
+            &["middle", "middle_click"],
+        ),
+        (
+            ButtonAction::MouseClick(MouseClickButton::Back),
+            &["back", "backward"],
+        ),
+        (
+            ButtonAction::MouseClick(MouseClickButton::Forward),
+            &["forward"],
+        ),
+        (ButtonAction::DpiLoop, &["dpi", "dpi_loop"]),
+        (ButtonAction::ScrollUp, &["scroll_up"]),
+        (ButtonAction::ScrollDown, &["scroll_down"]),
+        (ButtonAction::Disabled, &["disabled", "none"]),
+    ] {
+        if aliases
+            .iter()
+            .any(|alias| token.eq_ignore_ascii_case(alias))
+        {
+            return Ok(action);
+        }
+    }
+
+    for (media_fn, spec_key) in MEDIA_SPEC_TABLE {
+        if token.eq_ignore_ascii_case(spec_key) {
+            return Ok(ButtonAction::Media(media_fn));
+        }
+    }
+
+    if let Some(hex_body) = token
+        .strip_prefix("raw:")
+        .or_else(|| token.strip_prefix("RAW:"))
+    {
+        let decoded = decode_flexible_hex(hex_body).map_err(|e| {
+            DeviceError::Profile(format!("invalid raw button descriptor '{token}': {e}"))
+        })?;
+        let raw_arr: [u8; 4] = decoded.try_into().map_err(|_| {
+            DeviceError::Profile(format!("raw button descriptor '{token}' must be 4 bytes"))
+        })?;
+        return Ok(ButtonAction::from_bytes(raw_arr));
+    }
+
+    Err(DeviceError::Profile(format!(
+        "unknown button binding '{token}'"
+    )))
+}
+
+fn parse_modifier_list(modifiers: &[String]) -> u8 {
+    let mut mask = 0u8;
+    for item in modifiers {
+        for (bit, names) in [
+            (KeyModifiers::LCTRL, &["ctrl", "lctrl"][..]),
+            (KeyModifiers::LSHIFT, &["shift", "lshift"]),
+            (KeyModifiers::LALT, &["alt", "lalt"]),
+            (KeyModifiers::LWIN, &["win", "super", "lgui", "lwin"]),
+            (KeyModifiers::RCTRL, &["rctrl"]),
+            (KeyModifiers::RSHIFT, &["rshift"]),
+            (KeyModifiers::RALT, &["ralt"]),
+            (KeyModifiers::RWIN, &["rwin", "rgui"]),
+        ] {
+            if names.iter().any(|name| item.eq_ignore_ascii_case(name)) {
+                mask |= bit;
+            }
+        }
+    }
+    mask
 }
 
 fn spec_from_action(action: ButtonAction) -> ButtonBindingSpec {
@@ -436,40 +508,29 @@ fn spec_from_action(action: ButtonAction) -> ButtonBindingSpec {
         ButtonAction::ScrollUp => ButtonBindingSpec::Simple("scroll_up".to_owned()),
         ButtonAction::ScrollDown => ButtonBindingSpec::Simple("scroll_down".to_owned()),
         ButtonAction::Disabled => ButtonBindingSpec::Simple("disabled".to_owned()),
-        ButtonAction::Media(MediaFunction::VolumeUp) => {
-            ButtonBindingSpec::Simple("media:vol_up".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::VolumeDown) => {
-            ButtonBindingSpec::Simple("media:vol_down".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::Mute) => {
-            ButtonBindingSpec::Simple("media:mute".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::PlayPause) => {
-            ButtonBindingSpec::Simple("media:play_pause".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::NextTrack) => {
-            ButtonBindingSpec::Simple("media:next".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::PrevTrack) => {
-            ButtonBindingSpec::Simple("media:prev".to_owned())
-        }
-        ButtonAction::Media(MediaFunction::Calculator) => {
-            ButtonBindingSpec::Simple("media:calculator".to_owned())
+        ButtonAction::Media(func) => {
+            let key = MEDIA_SPEC_TABLE
+                .iter()
+                .find(|(m, _)| *m == func)
+                .map(|(_, key)| *key)
+                .unwrap_or("disabled");
+            ButtonBindingSpec::Simple(key.to_owned())
         }
         ButtonAction::KeyboardShortcut { modifiers, keycode } => {
             let mut mods = Vec::new();
-            if modifiers.has_ctrl() {
-                mods.push("ctrl".to_owned());
-            }
-            if modifiers.has_shift() {
-                mods.push("shift".to_owned());
-            }
-            if modifiers.has_alt() {
-                mods.push("alt".to_owned());
-            }
-            if modifiers.has_win() {
-                mods.push("win".to_owned());
+            for (bit, label) in [
+                (KeyModifiers::LCTRL, "ctrl"),
+                (KeyModifiers::LSHIFT, "shift"),
+                (KeyModifiers::LALT, "alt"),
+                (KeyModifiers::LWIN, "win"),
+                (KeyModifiers::RCTRL, "rctrl"),
+                (KeyModifiers::RSHIFT, "rshift"),
+                (KeyModifiers::RALT, "ralt"),
+                (KeyModifiers::RWIN, "rwin"),
+            ] {
+                if (modifiers.0 & bit) != 0 {
+                    mods.push(label.to_owned());
+                }
             }
             ButtonBindingSpec::Structured {
                 kind: "shortcut".to_owned(),
@@ -481,7 +542,7 @@ fn spec_from_action(action: ButtonAction) -> ButtonBindingSpec {
             }
         }
         ButtonAction::Macro { slot, trigger } => {
-            let (repeat, mode) = match trigger {
+            let (repeat, loop_mode) = match trigger {
                 MacroTrigger::FixedCount(n) => (Some(n), Some("fixed".to_owned())),
                 MacroTrigger::HoldToLoop => (None, Some("hold".to_owned())),
                 MacroTrigger::ToggleLoop => (None, Some("toggle".to_owned())),
@@ -492,11 +553,11 @@ fn spec_from_action(action: ButtonAction) -> ButtonBindingSpec {
                 keycode: None,
                 macro_slot: Some(slot),
                 repeat,
-                loop_mode: mode,
+                loop_mode,
             }
         }
-        ButtonAction::Media(_) | ButtonAction::Raw(_) => {
-            ButtonBindingSpec::Simple("disabled".to_owned())
+        ButtonAction::Raw([b0, b1, b2, b3]) => {
+            ButtonBindingSpec::Simple(format!("raw:{b0:02x}{b1:02x}{b2:02x}{b3:02x}"))
         }
     }
 }

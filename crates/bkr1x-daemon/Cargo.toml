@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 bkr1x-protocol.workspace = true
 bkr1x-hal.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]

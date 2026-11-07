@@ -1,5 +1,3 @@
-//! `bkr1x-cli` — Command-line interface for the Fire Phoenix BK-R1X wireless gaming mouse.
-
 mod bundle_scan;
 
 use std::path::{Path, PathBuf};
@@ -9,13 +7,13 @@ use std::time::Duration;
 use bkr1x_hal::profile::{format_light_mode, parse_light_mode};
 use bkr1x_hal::{
     Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
-    extract_sfx_from_exe, install_user_application, is_autostart_enabled, is_daemon_running,
-    pack_sfx_installer, resolve_sibling_binary, send_ipc_request, set_autostart_enabled,
-    uninstall_user_application,
+    decode_flexible_hex, encode_hex_spaced, extract_sfx_from_exe, install_user_application,
+    is_autostart_enabled, is_daemon_running, pack_sfx_installer, platform_exe_name,
+    resolve_sibling_binary, send_ipc_request, set_autostart_enabled, uninstall_user_application,
 };
 use bkr1x_protocol::{
-    ChecksumStrategy, DecodedPacket, LodHeight, MacroStep, MouseConfig, PacketCodec, PollingRate,
-    ScrollDirection, validate_dpi,
+    ChecksumStrategy, DecodedPacket, LodHeight, MAX_DPI_STAGES, MacroStep, MouseConfig,
+    PacketCodec, PollingRate, ScrollDirection, SensorFlags, validate_dpi,
 };
 use clap::{Parser, Subcommand};
 
@@ -38,53 +36,38 @@ struct Cli {
 enum Commands {
     /// Query connection mode, battery %, charging state, active DPI stage, and polling rate.
     Status {
-        /// Output machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Output Waybar / Polybar custom-module JSON line.
         #[arg(long)]
         waybar: bool,
-        /// Force an immediate hardware poll instead of reading the daemon's cached snapshot.
         #[arg(long)]
         refresh: bool,
     },
 
     /// Update PAW3311 sensor & MCU parameters on the mouse.
     Set {
-        /// Set active stage DPI (`50..=18000` in steps of 50).
         #[arg(long)]
         dpi: Option<u16>,
-        /// Select active DPI stage (`1..=6`).
         #[arg(long)]
         stage: Option<u8>,
-        /// Comma-separated DPI stages (e.g. `800,1200,1600,3200`).
         #[arg(long)]
         stages: Option<String>,
-        /// USB / 2.4GHz polling rate in Hz (`125`, `250`, `500`, `1000`).
         #[arg(long)]
         rate: Option<u16>,
-        /// Button debounce time in milliseconds (`0..=30`).
         #[arg(long)]
         debounce: Option<u8>,
-        /// Lift-Off Distance in millimeters (`1` or `2`).
         #[arg(long)]
         lod: Option<u8>,
-        /// Enable or disable PAW3311 Motion Sync (`true`/`false`).
         #[arg(long)]
         motion_sync: Option<bool>,
-        /// Enable or disable Angle Snapping / Linear Correction (`true`/`false`).
         #[arg(long)]
         angle_snap: Option<bool>,
-        /// Enable or disable Ripple Control (`true`/`false`).
         #[arg(long)]
         ripple: Option<bool>,
-        /// Deep-sleep timeout in minutes (`1, 3, 5, 10, 20, 30, 60`).
         #[arg(long)]
         sleep: Option<u8>,
-        /// LED mode (`off`, `wave`, `neon`, `flash`, `yoyo`, `single`, `breathing`).
         #[arg(long)]
         light: Option<String>,
-        /// Validate and print the generated 65-byte HID packet in hex without writing to hardware.
         #[arg(long)]
         dry_run: bool,
     },
@@ -97,25 +80,18 @@ enum Commands {
 
     /// Dry-run HID packet parser, checksum verifier, and protocol debugger.
     SniffVerify {
-        /// Raw hex packet string (e.g. `"00 55 0f ae 0a ..."` or `"aa 30 ..."`).
         raw_hex: String,
-        /// Checksum strategy (`none`, `sum55`, `sum00`, `xor`, `crc16`).
         #[arg(long, default_value = "none")]
         checksum: String,
     },
 
     /// Scan downloaded `bk-r1x.yjx2012.com` JS bundles to extract VID/PIDs and opcodes.
-    AnalyzeBundle {
-        /// Directory containing `.js` chunks.
-        bundle_dir: PathBuf,
-    },
+    AnalyzeBundle { bundle_dir: PathBuf },
 
     /// Install BK-R1X into your user profile, create Start Menu shortcut, register Windows Startup, and launch the System Tray icon.
     Install {
-        /// Skip registering automatic launch at Windows login.
         #[arg(long)]
         no_autostart: bool,
-        /// Do not immediately start the background System Tray daemon after installing.
         #[arg(long)]
         no_start_tray: bool,
     },
@@ -134,10 +110,8 @@ enum Commands {
 
     /// Bundle `bkr1x-installer`, `bkr1x-daemon`, `bkr1x-gui`, and `bkr1x-cli` into a standalone GitHub Release `.exe` Setup Wizard.
     PackageInstaller {
-        /// Directory containing compiled release binaries (defaults to the folder of `bkr1x-cli`).
         #[arg(long)]
         bin_dir: Option<PathBuf>,
-        /// Output path for the standalone installer (defaults to `dist/windows/BKR1X-Setup-v<ver>-x64.exe`).
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -145,13 +119,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum TrayAction {
-    /// Start `bkr1x-daemon` in the background taskbar notification area if not already running.
     Start,
-    /// Gracefully stop the running `bkr1x-daemon` System Tray process.
     Stop,
-    /// Show whether the System Tray daemon is running and whether Windows Startup is enabled.
     Status,
-    /// Enable or disable automatic launch at Windows login (`on` / `off`).
     Autostart {
         #[arg(value_parser = ["on", "off", "true", "false"])]
         state: String,
@@ -160,17 +130,13 @@ enum TrayAction {
 
 #[derive(Subcommand, Debug)]
 enum ProfileAction {
-    /// Validate and flash a `.toml` or `.json` profile to the BK-R1X.
     Apply {
         path: PathBuf,
-        /// Validate and preview wire packets without writing to hardware.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Read current settings from the mouse (or factory template if `--template`) and save to disk.
     Export {
         path: PathBuf,
-        /// Export a factory-default template without requiring hardware connected.
         #[arg(long)]
         template: bool,
     },
@@ -260,7 +226,7 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
             ..
         }) = send_ipc_request(&req)
         {
-            return Ok(snap);
+            return Ok(*snap);
         }
     }
 
@@ -269,7 +235,7 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
     let info = dev.info().clone();
     let st = dev.state();
     let cfg = &st.config;
-    let raw_buttons: [[u8; 4]; 8] = core::array::from_fn(|i| st.buttons.slots[i].to_bytes());
+    let raw_buttons: [[u8; 4]; 8] = core::array::from_fn(|idx| st.buttons.slots[idx].to_bytes());
     Ok(DaemonStatusSnapshot {
         connected: true,
         online: st.online,
@@ -281,8 +247,12 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
         battery_percent: st.battery.percent,
         charging: st.battery.charging,
         active_dpi: cfg.active_dpi(),
-        active_dpi_stage: cfg.active_dpi_stage + 1,
-        dpi_stages: cfg.dpi_stages[..cfg.dpi_count as usize].to_vec(),
+        active_dpi_stage: cfg.active_dpi_stage.saturating_add(1),
+        dpi_stages: cfg
+            .dpi_stages
+            .get(..usize::from(cfg.dpi_count))
+            .unwrap_or(&cfg.dpi_stages)
+            .to_vec(),
         polling_rate_hz: cfg.polling_rate.as_hz(),
         lod_mm: cfg.lod.as_mm(),
         debounce_ms: cfg.debounce_ms,
@@ -298,6 +268,43 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
         active_profile: None,
         button_slots: Some(raw_buttons),
     })
+}
+
+fn mouse_config_from_snapshot(snap: &DaemonStatusSnapshot) -> MouseConfig {
+    let mut dpi_stages = MouseConfig::factory_default().dpi_stages;
+    for (idx, &dpi) in snap.dpi_stages.iter().take(MAX_DPI_STAGES).enumerate() {
+        dpi_stages[idx] = dpi;
+    }
+    let max_stages = MAX_DPI_STAGES as u8;
+    let dpi_count = u8::try_from(snap.dpi_stages.len())
+        .unwrap_or(max_stages)
+        .clamp(1, max_stages);
+    let active_dpi_stage = snap.active_dpi_stage.saturating_sub(1).min(dpi_count - 1);
+
+    MouseConfig {
+        dpi_stages,
+        dpi_count,
+        active_dpi_stage,
+        polling_rate: PollingRate::from_hz(snap.polling_rate_hz).unwrap_or(PollingRate::Hz1000),
+        lod: LodHeight::from_mm(snap.lod_mm).unwrap_or(LodHeight::Mm1),
+        debounce_ms: snap.debounce_ms,
+        sensor_flags: SensorFlags {
+            ripple_control: snap.ripple_control,
+            angle_snapping: snap.angle_snapping,
+            motion_sync: snap.motion_sync,
+            reserved_bits: SensorFlags::BIT_FACTORY_BASE,
+        },
+        sleep_minutes: snap.sleep_minutes,
+        light_mode: parse_light_mode(&snap.light_mode).unwrap_or_default(),
+        scroll_direction: if snap.reverse_scroll {
+            ScrollDirection::Reverse
+        } else {
+            ScrollDirection::Normal
+        },
+        highspeed_mode: snap.highspeed_mode,
+        wakeup_on_move: snap.wakeup_on_move,
+        move_lights_off: snap.move_lights_off,
+    }
 }
 
 fn cmd_status(direct: bool, json: bool, waybar: bool, refresh: bool) -> Result<(), DeviceError> {
@@ -401,33 +408,19 @@ struct SetOverrides {
     dry_run: bool,
 }
 
-fn cmd_set(direct: bool, ov: SetOverrides) -> Result<(), DeviceError> {
-    let mut dev_opt = if ov.dry_run {
-        None
-    } else {
-        Bkr1xDevice::open_auto().ok()
-    };
-
-    let mut cfg = if let Some(dev) = dev_opt.as_mut() {
-        dev.read_config().unwrap_or_default()
-    } else {
-        MouseConfig::factory_default()
-    };
-
+fn apply_cli_overrides(cfg: &mut MouseConfig, ov: &SetOverrides) -> Result<(), DeviceError> {
     if let Some(csv) = &ov.stages {
-        let parsed: Result<Vec<u16>, _> = csv
-            .split(',')
-            .map(|s| s.trim().parse::<u16>())
-            .collect();
-        let list = parsed.map_err(|e| DeviceError::Profile(format!("invalid --stages CSV: {e}")))?;
-        if list.is_empty() || list.len() > 6 {
+        let parsed: Result<Vec<u16>, _> = csv.split(',').map(|s| s.trim().parse::<u16>()).collect();
+        let list =
+            parsed.map_err(|e| DeviceError::Profile(format!("invalid --stages CSV: {e}")))?;
+        if list.is_empty() || list.len() > MAX_DPI_STAGES {
             return Err(DeviceError::Profile(
                 "--stages must specify between 1 and 6 DPI values".to_owned(),
             ));
         }
-        for (i, &v) in list.iter().enumerate() {
-            validate_dpi(i, v)?;
-            cfg.dpi_stages[i] = v;
+        for (idx, &dpi) in list.iter().enumerate() {
+            validate_dpi(idx, dpi)?;
+            cfg.dpi_stages[idx] = dpi;
         }
         cfg.dpi_count = list.len() as u8;
         if cfg.active_dpi_stage >= cfg.dpi_count {
@@ -435,26 +428,31 @@ fn cmd_set(direct: bool, ov: SetOverrides) -> Result<(), DeviceError> {
         }
     }
 
-    if let Some(st) = ov.stage {
-        if st == 0 || st > cfg.dpi_count {
+    if let Some(stage_one_based) = ov.stage {
+        if stage_one_based == 0 || stage_one_based > cfg.dpi_count {
             return Err(DeviceError::Profile(format!(
-                "--stage {st} out of bounds for {} configured stages",
+                "--stage {stage_one_based} out of bounds for {} configured stages",
                 cfg.dpi_count
             )));
         }
-        cfg.active_dpi_stage = st - 1;
+        cfg.active_dpi_stage = stage_one_based - 1;
     }
 
     if let Some(dpi) = ov.dpi {
-        validate_dpi(cfg.active_dpi_stage as usize, dpi)?;
-        if let Some(existing_idx) = cfg.dpi_stages[..cfg.dpi_count as usize]
+        let active_idx = usize::from(cfg.active_dpi_stage);
+        validate_dpi(active_idx, dpi)?;
+        let enabled_stages = cfg
+            .dpi_stages
+            .get(..usize::from(cfg.dpi_count))
+            .unwrap_or(&cfg.dpi_stages);
+        if let Some(existing_idx) = enabled_stages
             .iter()
-            .position(|&d| d == dpi)
+            .position(|&stage_dpi| stage_dpi == dpi)
             && ov.stage.is_none()
         {
             cfg.active_dpi_stage = existing_idx as u8;
-        } else {
-            cfg.dpi_stages[cfg.active_dpi_stage as usize] = dpi;
+        } else if let Some(slot) = cfg.dpi_stages.get_mut(active_idx) {
+            *slot = dpi;
         }
     }
 
@@ -479,14 +477,36 @@ fn cmd_set(direct: bool, ov: SetOverrides) -> Result<(), DeviceError> {
     if let Some(min) = ov.sleep {
         cfg.sleep_minutes = min;
     }
-    if let Some(ref l) = ov.light {
-        cfg.light_mode = parse_light_mode(l)?;
+    if let Some(ref light_str) = ov.light {
+        cfg.light_mode = parse_light_mode(light_str)?;
     }
+    Ok(())
+}
 
-    // Strict PAW3311 validation prior to generating or sending HID report
+fn cmd_set(direct: bool, ov: SetOverrides) -> Result<(), DeviceError> {
+    let mut dev_opt: Option<Bkr1xDevice> = None;
+
+    let mut cfg = if ov.dry_run {
+        MouseConfig::factory_default()
+    } else if !direct
+        && let Ok(IpcResponse::Ok {
+            snapshot: Some(snap),
+            ..
+        }) = send_ipc_request(&IpcRequest::GetFullState)
+    {
+        mouse_config_from_snapshot(&snap)
+    } else {
+        dev_opt = Bkr1xDevice::open_auto().ok();
+        dev_opt
+            .as_mut()
+            .and_then(|dev| dev.read_config().ok())
+            .unwrap_or_default()
+    };
+
+    apply_cli_overrides(&mut cfg, &ov)?;
+
     let codec = PacketCodec::new(ChecksumStrategy::None);
-    let rpt = codec.encode_set_mouse_config(&cfg)?;
-    let wire = rpt.to_wire_bytes();
+    let wire = codec.encode_set_mouse_config(&cfg)?.to_wire_bytes();
 
     if ov.dry_run {
         println!("[DRY-RUN] Validated PAW3311 configuration:");
@@ -501,29 +521,35 @@ fn cmd_set(direct: bool, ov: SetOverrides) -> Result<(), DeviceError> {
             cfg.sensor_flags.to_bits()
         );
         println!("[DRY-RUN] 65-byte HID Output Frame:");
-        println!("  {}", format_hex_slice(&wire));
+        println!("  {}", encode_hex_spaced(&wire));
         return Ok(());
     }
 
-    // Try daemon IPC if not `--direct` and we didn't already open a direct handle
     if !direct && dev_opt.is_none() {
-        let prof = HardwareProfile::from_hardware("CLI Set", &cfg, &Default::default());
-        if let Ok(IpcResponse::Ok { .. }) = send_ipc_request(&IpcRequest::ApplyProfile {
+        let mut prof = HardwareProfile::from_hardware("CLI Set", &cfg, &Default::default());
+        // Leave `buttons = None` so `bkr1x-cli set` never overwrites custom button remaps.
+        prof.buttons = None;
+        if let Ok(resp) = send_ipc_request(&IpcRequest::ApplyProfile {
             profile: Box::new(prof),
         }) {
-            println!(
-                "Applied settings via bkr1x-daemon: {} DPI @ {} Hz (LOD {}mm, Debounce {}ms)",
-                cfg.active_dpi(),
-                cfg.polling_rate.as_hz(),
-                cfg.lod.as_mm(),
-                cfg.debounce_ms
-            );
-            return Ok(());
+            return match resp {
+                IpcResponse::Ok { .. } => {
+                    println!(
+                        "Applied settings via bkr1x-daemon: {} DPI @ {} Hz (LOD {}mm, Debounce {}ms)",
+                        cfg.active_dpi(),
+                        cfg.polling_rate.as_hz(),
+                        cfg.lod.as_mm(),
+                        cfg.debounce_ms
+                    );
+                    Ok(())
+                }
+                IpcResponse::Error { message } => Err(DeviceError::Ipc(message)),
+            };
         }
     }
 
     let mut dev = match dev_opt {
-        Some(d) => d,
+        Some(existing) => existing,
         None => Bkr1xDevice::open_auto()?,
     };
     dev.write_config(&cfg)?;
@@ -557,25 +583,39 @@ fn cmd_profile_apply(direct: bool, path: &Path, dry_run: bool) -> Result<(), Dev
             profile.name,
             path.display()
         );
-        println!("  SET_MOUSE_CONFIG (0x0F): {}", format_hex_slice(&cfg_wire));
+        println!(
+            "  SET_MOUSE_CONFIG (0x0F): {}",
+            encode_hex_spaced(&cfg_wire)
+        );
         if profile.buttons.is_some() {
-            println!("  SET_MOUSE_KEYS   (0x09): {}", format_hex_slice(&btn_wire));
+            println!(
+                "  SET_MOUSE_KEYS   (0x09): {}",
+                encode_hex_spaced(&btn_wire)
+            );
         }
-        println!("  Hardware Macros        : {} sequence(s)", macro_vecs.len());
+        println!(
+            "  Hardware Macros        : {} sequence(s)",
+            macro_vecs.len()
+        );
         return Ok(());
     }
 
     if !direct
-        && let Ok(IpcResponse::Ok { message, .. }) = send_ipc_request(&IpcRequest::ApplyProfile {
+        && let Ok(resp) = send_ipc_request(&IpcRequest::ApplyProfile {
             profile: Box::new(profile.clone()),
         })
     {
-        println!(
-            "Applied profile '{}' via daemon ({})",
-            profile.name,
-            message.unwrap_or_else(|| "ok".to_owned())
-        );
-        return Ok(());
+        return match resp {
+            IpcResponse::Ok { message, .. } => {
+                println!(
+                    "Applied profile '{}' via daemon ({})",
+                    profile.name,
+                    message.as_deref().unwrap_or("ok")
+                );
+                Ok(())
+            }
+            IpcResponse::Error { message } => Err(DeviceError::Ipc(message)),
+        };
     }
 
     let mut dev = Bkr1xDevice::open_auto()?;
@@ -618,12 +658,14 @@ fn cmd_profile_export(path: &Path, template: bool) -> Result<(), DeviceError> {
 }
 
 fn cmd_sniff_verify(raw_hex: &str, checksum_arg: &str) -> Result<(), String> {
-    let strategy = match checksum_arg.to_ascii_lowercase().as_str() {
-        "none" => ChecksumStrategy::None,
-        "sum55" => ChecksumStrategy::SumComplement(0x55),
-        "sum00" | "twos" => ChecksumStrategy::SumComplement(0x00),
-        "xor" => ChecksumStrategy::Xor,
-        "crc16" => ChecksumStrategy::Crc16Ccitt,
+    let strategy = match checksum_arg {
+        s if s.eq_ignore_ascii_case("none") => ChecksumStrategy::None,
+        s if s.eq_ignore_ascii_case("sum55") => ChecksumStrategy::SumComplement(0x55),
+        s if s.eq_ignore_ascii_case("sum00") || s.eq_ignore_ascii_case("twos") => {
+            ChecksumStrategy::SumComplement(0x00)
+        }
+        s if s.eq_ignore_ascii_case("xor") => ChecksumStrategy::Xor,
+        s if s.eq_ignore_ascii_case("crc16") => ChecksumStrategy::Crc16Ccitt,
         other => {
             return Err(format!(
                 "unknown --checksum '{other}' (expected none, sum55, sum00, xor, crc16)"
@@ -631,8 +673,12 @@ fn cmd_sniff_verify(raw_hex: &str, checksum_arg: &str) -> Result<(), String> {
         }
     };
 
-    let bytes = parse_flexible_hex(raw_hex)?;
-    println!("Parsed {} byte(s): {}", bytes.len(), format_hex_slice(&bytes));
+    let bytes = decode_flexible_hex(raw_hex)?;
+    println!(
+        "Parsed {} byte(s): {}",
+        bytes.len(),
+        encode_hex_spaced(&bytes)
+    );
 
     let codec = PacketCodec::new(strategy);
     let decoded = codec
@@ -642,12 +688,12 @@ fn cmd_sniff_verify(raw_hex: &str, checksum_arg: &str) -> Result<(), String> {
     println!("Checksum ({strategy:?}) : VALID");
     match decoded {
         DecodedPacket::TxSetMouseConfig(cfg) | DecodedPacket::RxMouseConfig(cfg) => {
-            let dir = if matches!(decoded, DecodedPacket::TxSetMouseConfig(_)) {
+            let direction = if matches!(decoded, DecodedPacket::TxSetMouseConfig(_)) {
                 "TX Host -> Mouse (0x0F SET_MOUSE_CONFIG)"
             } else {
                 "RX Mouse -> Host (0x0E GET_MOUSE_CONFIG Reply)"
             };
-            println!("Packet Type            : {dir}");
+            println!("Packet Type            : {direction}");
             println!(
                 "Active DPI             : {} DPI (Stage {}/{})",
                 cfg.active_dpi(),
@@ -671,52 +717,13 @@ fn cmd_sniff_verify(raw_hex: &str, checksum_arg: &str) -> Result<(), String> {
         }
         DecodedPacket::TxSetMouseKeys(btns) | DecodedPacket::RxMouseKeys(btns) => {
             println!("Packet Type            : Button Mapping Frame (8 slots)");
-            for (i, slot) in btns.slots.iter().enumerate() {
-                println!("  Slot {i}: {slot:?} -> {:02X?}", slot.to_bytes());
+            for (idx, slot) in btns.slots.iter().enumerate() {
+                println!("  Slot {idx}: {slot:?} -> {:02X?}", slot.to_bytes());
             }
         }
-        other => {
-            println!("Decoded Packet         : {other:#?}");
-        }
+        other => println!("Decoded Packet         : {other:#?}"),
     }
     Ok(())
-}
-
-fn parse_flexible_hex(input: &str) -> Result<Vec<u8>, String> {
-    let cleaned: String = input
-        .replace("0x", " ")
-        .replace("0X", " ")
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
-
-    if cleaned.is_empty() {
-        return Err("hex string contains no hexadecimal digits".to_owned());
-    }
-    if !cleaned.len().is_multiple_of(2) {
-        return Err(format!(
-            "hex string has odd nibble count ({} hex chars)",
-            cleaned.len()
-        ));
-    }
-
-    let mut out = Vec::with_capacity(cleaned.len() / 2);
-    let mut i = 0;
-    while i < cleaned.len() {
-        let byte = u8::from_str_radix(&cleaned[i..i + 2], 16)
-            .map_err(|e| format!("invalid hex byte at offset {i}: {e}"))?;
-        out.push(byte);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn format_hex_slice(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn spawn_detached_process(exe: &Path, args: &[&str]) -> Result<(), String> {
@@ -763,18 +770,23 @@ fn cmd_install(enable_autostart: bool, start_tray_now: bool) -> Result<(), Strin
     if start_tray_now {
         spawn_detached_process(&summary.daemon_exe, &["--silent-if-running"])?;
         std::thread::sleep(Duration::from_millis(350));
-        if is_daemon_running() {
-            println!("  System Tray State : Running in taskbar notification area");
-        } else {
-            println!("  System Tray State : Launched");
-        }
+        println!(
+            "  System Tray State : {}",
+            if is_daemon_running() {
+                "Running in taskbar notification area"
+            } else {
+                "Launched"
+            }
+        );
     }
     Ok(())
 }
 
 fn cmd_uninstall() -> Result<(), String> {
     uninstall_user_application()?;
-    println!("Stopped background System Tray daemon and removed Windows Startup + Start Menu entries.");
+    println!(
+        "Stopped background System Tray daemon and removed Windows Startup + Start Menu entries."
+    );
     Ok(())
 }
 
@@ -809,9 +821,10 @@ fn cmd_tray(action: TrayAction) -> Result<(), String> {
             Ok(())
         }
         TrayAction::Stop => {
-            match send_ipc_request(&IpcRequest::Shutdown) {
-                Ok(_) => println!("Sent clean shutdown signal to System Tray daemon."),
-                Err(_) => println!("System Tray daemon was not running."),
+            if send_ipc_request(&IpcRequest::Shutdown).is_ok() {
+                println!("Sent clean shutdown signal to System Tray daemon.");
+            } else {
+                println!("System Tray daemon was not running.");
             }
             Ok(())
         }
@@ -853,25 +866,24 @@ fn cmd_package_installer(
     output_override: Option<&Path>,
 ) -> Result<(), String> {
     let bin_dir = match bin_dir_override {
-        Some(p) => p.to_path_buf(),
+        Some(path) => path.to_path_buf(),
         None => std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .ok_or_else(|| "cannot determine current executable directory".to_owned())?,
     };
 
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let stub_name = format!("bkr1x-installer{ext}");
-    let daemon_name = format!("bkr1x-daemon{ext}");
-    let gui_name = format!("bkr1x-gui{ext}");
-    let cli_name = format!("bkr1x-cli{ext}");
+    let stub_name = platform_exe_name("bkr1x-installer");
+    let daemon_name = platform_exe_name("bkr1x-daemon");
+    let gui_name = platform_exe_name("bkr1x-gui");
+    let cli_name = platform_exe_name("bkr1x-cli");
 
     let read_bin = |fname: &str| -> Result<Vec<u8>, String> {
-        let p = bin_dir.join(fname);
-        std::fs::read(&p).map_err(|e| {
+        let path = bin_dir.join(fname);
+        std::fs::read(&path).map_err(|e| {
             format!(
                 "missing compiled binary {} ({e}) — run `cargo build --release --workspace` first",
-                p.display()
+                path.display()
             )
         })
     };
@@ -892,10 +904,13 @@ fn cmd_package_installer(
     )?;
 
     let out_path = match output_override {
-        Some(p) => p.to_path_buf(),
+        Some(path) => path.to_path_buf(),
         None => PathBuf::from("dist")
             .join("windows")
-            .join(format!("BKR1X-Setup-v{}-x64{ext}", env!("CARGO_PKG_VERSION"))),
+            .join(platform_exe_name(&format!(
+                "BKR1X-Setup-v{}-x64",
+                env!("CARGO_PKG_VERSION")
+            ))),
     };
 
     if let Some(parent) = out_path.parent() {
@@ -905,7 +920,6 @@ fn cmd_package_installer(
     std::fs::write(&out_path, &sfx_exe)
         .map_err(|e| format!("failed writing {}: {e}", out_path.display()))?;
 
-    // Self-verify archive CRC16 & decompression before declaring release ready
     let verified = extract_sfx_from_exe(&out_path)?
         .ok_or_else(|| "verification failed: missing BKR1XSFX trailer".to_owned())?;
     if verified.files.len() != 3 {

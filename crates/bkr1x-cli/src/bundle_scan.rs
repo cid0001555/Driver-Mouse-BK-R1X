@@ -1,5 +1,3 @@
-//! Native Rust AST/token scanner for downloaded `bk-r1x.yjx2012.com` JS bundles.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -16,11 +14,11 @@ pub fn scan_bundle_directory(dir: &Path) -> Result<(), String> {
     let mut js_count = 0usize;
 
     for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("js") {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("js") {
             continue;
         }
-        let Ok(txt) = fs::read_to_string(&p) else {
+        let Ok(txt) = fs::read_to_string(&path) else {
             continue;
         };
         js_count += 1;
@@ -73,127 +71,176 @@ pub fn scan_bundle_directory(dir: &Path) -> Result<(), String> {
 
     println!("\n[5] CHECKSUM & AUTHENTICATION SUMMARY");
     println!("  • Strategy : ChecksumStrategy::None (Zero-padded 64B payload)");
-    println!("  • Framing  : TX=0x55, RX=0xAA, ReadAuth=[0xA5, 0x0B], WriteKeys=[0xA5, 0x22], WriteCfg=[0xAE, 0x0A]");
+    println!(
+        "  • Framing  : TX=0x55, RX=0xAA, ReadAuth=[0xA5, 0x0B], WriteKeys=[0xA5, 0x22], WriteCfg=[0xAE, 0x0A]"
+    );
     println!("==========================================================================");
     Ok(())
+}
+
+fn leading_ascii_digits(s: &str) -> &str {
+    let end = s
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    &s[..end]
+}
+
+fn trailing_ascii_digits(s: &str) -> &str {
+    let count = s
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    &s[s.len() - count..]
+}
+
+fn leading_js_ident(s: &str) -> &str {
+    let end = s
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    &s[..end]
 }
 
 fn find_usb_vid(txt: &str) -> Option<u16> {
     let marker = "getConnectMode(){return ";
     let idx = txt.find(marker)?;
-    let rest = &txt[idx + marker.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u16>().ok()
+    leading_ascii_digits(&txt[idx + marker.len()..])
+        .parse()
+        .ok()
 }
 
 fn extract_filter_tuples(txt: &str, out: &mut BTreeSet<(u16, u16, u16, u16)>) {
+    const VENDOR_KEY: &str = "vendorId:";
     let mut search_from = 0;
-    while let Some(rel) = txt[search_from..].find("vendorId:") {
+    while let Some(rel) = txt[search_from..].find(VENDOR_KEY) {
         let pos = search_from + rel;
-        let window_end = (pos + 120).min(txt.len());
+        let window_end = txt.floor_char_boundary(pos.saturating_add(120));
         let slice = &txt[pos..window_end];
-        let close = slice.find('}').unwrap_or(slice.len());
-        let obj = &slice[..close];
+        let obj = &slice[..slice.find('}').unwrap_or(slice.len())];
 
-        if let (Some(vid), Some(pid), Some(up), Some(u)) = (
-            read_kv_u16(obj, "vendorId:"),
+        if let (Some(vid), Some(pid), Some(up), Some(usage)) = (
+            read_kv_u16(obj, VENDOR_KEY),
             read_kv_u16(obj, "productId:"),
             read_kv_u16(obj, "usagePage:"),
             read_kv_u16(obj, "usage:"),
         ) {
-            out.insert((vid, pid, up, u));
+            out.insert((vid, pid, up, usage));
         }
-        search_from = pos + 9;
+        search_from = pos + VENDOR_KEY.len();
     }
 }
 
 fn read_kv_u16(s: &str, key: &str) -> Option<u16> {
     let idx = s.find(key)?;
-    let rest = &s[idx + key.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u16>().ok()
+    leading_ascii_digits(&s[idx + key.len()..]).parse().ok()
 }
 
 fn extract_array_allocs(txt: &str, out: &mut BTreeSet<usize>) {
-    let marker = "Array(";
+    const MARKER: &str = "Array(";
     let mut from = 0;
-    while let Some(rel) = txt[from..].find(marker) {
-        let pos = from + rel + marker.len();
+    while let Some(rel) = txt[from..].find(MARKER) {
+        let pos = from + rel + MARKER.len();
         let rest = &txt[pos..];
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = digits.parse::<usize>()
+        let digits = leading_ascii_digits(rest);
+        if let Ok(len) = digits.parse::<usize>()
             && rest[digits.len()..].starts_with(").fill(0)")
-            && matches!(n, 16 | 20 | 32 | 64 | 65 | 4032 | 4096)
+            && matches!(len, 16 | 20 | 32 | 64 | 65 | 4032 | 4096)
         {
-            out.insert(n);
+            out.insert(len);
         }
         from = pos;
     }
 }
 
 fn extract_tx_commands(txt: &str, out: &mut BTreeMap<u8, String>) {
-    let marker = "async ";
+    const MARKER: &str = "async ";
     let mut from = 0;
-    while let Some(rel) = txt[from..].find(marker) {
-        let pos = from + rel + marker.len();
+    while let Some(rel) = txt[from..].find(MARKER) {
+        let pos = from + rel + MARKER.len();
         let rest = &txt[pos..];
-        let fn_name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
+        let fn_name = leading_js_ident(rest);
         if !fn_name.is_empty() {
             let next_fn = rest[fn_name.len()..]
-                .find("async ")
-                .map(|i| fn_name.len() + i)
-                .unwrap_or(rest.len());
-            let body_window = &rest[..next_fn.min(900)];
-            // Match `[1]=85,[2]=<opcode>` or `[0,85,<opcode>,`
+                .find(MARKER)
+                .map_or(rest.len(), |idx| fn_name.len() + idx);
+            let window_end = rest.floor_char_boundary(next_fn.min(900));
+            let body_window = &rest[..window_end];
+
             for pat in ["[1]=85,e[2]=", "[1]=85,t[2]="] {
-                if let Some(p_idx) = body_window.find(pat) {
-                    let after = &body_window[p_idx + pat.len()..];
-                    let op_digits: String =
-                        after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if let Ok(op) = op_digits.parse::<u8>() {
-                        out.entry(op).or_insert_with(|| fn_name.clone());
-                    }
+                if let Some(p_idx) = body_window.find(pat)
+                    && let Ok(op) = leading_ascii_digits(&body_window[p_idx + pat.len()..]).parse()
+                {
+                    out.entry(op).or_insert_with(|| fn_name.to_owned());
                 }
             }
-            let inline_pat = "[0,85,";
+
+            const INLINE_PAT: &str = "[0,85,";
             let mut in_from = 0;
-            while let Some(i_idx) = body_window[in_from..].find(inline_pat) {
-                let abs = in_from + i_idx + inline_pat.len();
-                let after = &body_window[abs..];
-                let op_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(op) = op_digits.parse::<u8>() {
-                    out.entry(op).or_insert_with(|| fn_name.clone());
+            while let Some(i_idx) = body_window[in_from..].find(INLINE_PAT) {
+                let abs = in_from + i_idx + INLINE_PAT.len();
+                if let Ok(op) = leading_ascii_digits(&body_window[abs..]).parse() {
+                    out.entry(op).or_insert_with(|| fn_name.to_owned());
                 }
                 in_from = abs;
             }
         }
-        from = pos + 1;
+        from = pos;
     }
 }
 
 fn extract_rx_headers(txt: &str, out: &mut BTreeSet<(u8, u8)>) {
+    const MARKER: &str = "==n[0]&&";
     let mut from = 0;
-    while let Some(rel) = txt[from..].find("==n[0]&&") {
+    while let Some(rel) = txt[from..].find(MARKER) {
         let eq_pos = from + rel;
-        let before = &txt[..eq_pos];
-        let b0_str: String = before
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let after = &txt[eq_pos + "==n[0]&&".len()..];
-        let b1_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let b0_str = trailing_ascii_digits(&txt[..eq_pos]);
+        let after = &txt[eq_pos + MARKER.len()..];
+        let b1_str = leading_ascii_digits(after);
         if let (Ok(b0), Ok(b1)) = (b0_str.parse::<u8>(), b1_str.parse::<u8>())
             && after[b1_str.len()..].starts_with("==n[1]")
         {
             out.insert((b0, b1));
         }
-        from = eq_pos + 8;
+        from = eq_pos + MARKER.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_multibyte_bundle_windows_never_panic() {
+        let mut chunk = String::from(
+            "vendorId:43172,productId:8789,usagePage:65281,usage:16}鼠标回报率设置鼠标回报率设置鼠标回报率设置鼠标回报率设置",
+        );
+        chunk.push_str("async setMouseConfigData(){let e=Array(65).fill(0);e[1]=85,e[2]=15;");
+        for _ in 0..180 {
+            chunk.push_str("回报率");
+        }
+        chunk.push_str("if(170==n[0]&&48==n[1])return;}");
+
+        let mut filters = BTreeSet::new();
+        let mut sizes = BTreeSet::new();
+        let mut ops = BTreeMap::new();
+        let mut rx = BTreeSet::new();
+
+        extract_filter_tuples(&chunk, &mut filters);
+        extract_array_allocs(&chunk, &mut sizes);
+        extract_tx_commands(&chunk, &mut ops);
+        extract_rx_headers(&chunk, &mut rx);
+
+        assert!(filters.contains(&(0xA8A4, 0x2255, 0xFF01, 0x0010)));
+        assert!(sizes.contains(&65));
+        assert_eq!(
+            ops.get(&0x0F).map(String::as_str),
+            Some("setMouseConfigData")
+        );
+        assert!(rx.contains(&(0xAA, 0x30)));
     }
 }

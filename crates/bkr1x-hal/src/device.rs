@@ -1,11 +1,9 @@
-//! Safe vendor-defined HID discovery, tri-mode connection detection, and wireless sleep handling.
-
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bkr1x_protocol::{
-    BatteryTelemetry, ButtonMapping, ChecksumStrategy, ConnectionMode,
+    BatteryTelemetry, ButtonMapping, ChecksumStrategy, ConnectionMode, DecodedPacket,
     FirmwareVersion, HardwareStateMachine, LightMode, MACRO_CHUNK_DATA_LEN, MACRO_FLASH_TOTAL_LEN,
     MacroStep, MouseConfig, Opcode, PID_24GHZ_DONGLE, PID_WIRED, PacketCodec, REPORT_PAYLOAD_LEN,
     RX_MAGIC, RawReport, VENDOR_USAGE_BKR1X, VENDOR_USAGE_PAGE_BKR1X, VENDOR_USAGE_PAGE_MAX,
@@ -15,33 +13,38 @@ use hidapi::{DeviceInfo, HidApi, HidDevice};
 
 use crate::error::DeviceError;
 
-/// Non-blocking HID read timeout (150 ms) so wireless deep-sleep never hangs callers.
 pub const DEFAULT_READ_TIMEOUT_MS: i32 = 150;
-/// Maximum number of retry attempts when waking/polling across transient 2.4GHz RF drops.
 pub const MAX_WIRELESS_RETRIES: usize = 3;
-/// Base retry backoff delay in milliseconds (`30ms -> 60ms -> 120ms`).
 pub const RETRY_BACKOFF_BASE_MS: u64 = 30;
-/// Maximum retained raw wire frames in the diagnostic inspector ring buffer.
 pub const MAX_TRACE_ENTRIES: usize = 128;
 
-/// Direction of an intercepted HID packet in the HAL trace log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceDirection {
     Out,
     In,
 }
 
-/// Captured raw packet entry for the GUI "Raw HID Debugger" and CLI diagnostics.
-#[derive(Debug, Clone)]
+/// Fixed-size zero-heap wire trace frame; human-readable summaries are formatted lazily on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireTraceEntry {
     pub timestamp_unix_ms: u64,
     pub direction: TraceDirection,
     pub report_id: u8,
     pub payload: [u8; REPORT_PAYLOAD_LEN],
-    pub summary: String,
 }
 
-/// Custom VID/PID matcher entry allowing overrides for OEM batch variants.
+impl WireTraceEntry {
+    pub fn format_summary(&self, checksum: ChecksumStrategy) -> String {
+        let mut wire = [0u8; WIRE_FRAME_LEN];
+        wire[0] = self.report_id;
+        wire[1..].copy_from_slice(&self.payload);
+        match PacketCodec::new(checksum).decode(&wire) {
+            Ok(pkt) => format!("{pkt:?}"),
+            Err(_) => format!("RAW[0x{:02X}, 0x{:02X}]", self.payload[0], self.payload[1]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceIdRule {
     pub vendor_id: u16,
@@ -49,7 +52,6 @@ pub struct DeviceIdRule {
     pub mode: ConnectionMode,
 }
 
-/// Default hardware ID table extracted from `bk-r1x.yjx2012.com`.
 pub const DEFAULT_DEVICE_RULES: [DeviceIdRule; 2] = [
     DeviceIdRule {
         vendor_id: VID_WIRED,
@@ -63,7 +65,6 @@ pub const DEFAULT_DEVICE_RULES: [DeviceIdRule; 2] = [
     },
 ];
 
-/// Metadata of a matched vendor-defined HID interface prior to opening.
 #[derive(Debug, Clone)]
 pub struct DiscoveredInterface {
     pub path: CString,
@@ -75,7 +76,6 @@ pub struct DiscoveredInterface {
     pub mode: ConnectionMode,
 }
 
-/// Active connection to the BK-R1X vendor HID collection (`0xFF01 / 0x0010`).
 pub struct Bkr1xDevice {
     device: HidDevice,
     info: DiscoveredInterface,
@@ -86,32 +86,24 @@ pub struct Bkr1xDevice {
 }
 
 impl Bkr1xDevice {
-    /// Enumerates system HID collections and opens the BK-R1X Vendor-Defined interface (`0xFF00..=0xFFFF`).
-    ///
-    /// - Prefers **USB-C Wired (`0xA8A4:0x2255`)** over **2.4GHz Dongle (`0xA8A5:0x2255`)** when both are present,
-    ///   matching OEM WebHID driver priority.
-    /// - Strictly filters for `usage_page in 0xFF00..=0xFFFF` so standard OS mouse/keyboard collections are never
-    ///   claimed or locked.
-    /// - Detects Bluetooth-only connection and returns [`DeviceError::BluetoothConfigUnsupported`].
     pub fn open_auto() -> Result<Self, DeviceError> {
         Self::open_with_rules(&DEFAULT_DEVICE_RULES, ChecksumStrategy::None)
     }
 
-    /// Opens a BK-R1X device using explicit VID/PID rules and [`ChecksumStrategy`].
     pub fn open_with_rules(
         rules: &[DeviceIdRule],
         checksum: ChecksumStrategy,
     ) -> Result<Self, DeviceError> {
         let api = HidApi::new()?;
-        let found = discover_best_interface(&api, rules)?;
-        let device = api.open_path(found.path.as_c_str())?;
+        let info = discover_best_interface(&api, rules)?;
+        let device = api.open_path(info.path.as_c_str())?;
         let mut state = HardwareStateMachine::new();
-        state.connection = Some(found.mode);
-        state.online = found.mode == ConnectionMode::UsbWired;
+        state.connection = Some(info.mode);
+        state.online = info.mode == ConnectionMode::UsbWired;
 
         Ok(Self {
             device,
-            info: found,
+            info,
             codec: PacketCodec::new(checksum),
             state,
             last_battery_poll: None,
@@ -127,6 +119,10 @@ impl Bkr1xDevice {
         self.info.mode
     }
 
+    pub fn checksum_strategy(&self) -> ChecksumStrategy {
+        self.codec.checksum
+    }
+
     pub fn state(&self) -> &HardwareStateMachine {
         &self.state
     }
@@ -139,26 +135,28 @@ impl Bkr1xDevice {
         self.trace_log.clear();
     }
 
-    /// Drains any pending asynchronous telemetry reports (`0xAA 0xFA` / `0xAA 0xED`) without blocking.
     pub fn drain_async_events(&mut self) -> usize {
-        let mut count = 0;
+        let mut processed = 0;
         let mut raw = [0u8; WIRE_FRAME_LEN];
-        while let Ok(n) = self.device.read_timeout(&mut raw, 0) {
-            if n == 0 {
+        while let Ok(read_len) = self.device.read_timeout(&mut raw, 0) {
+            if read_len == 0 {
                 break;
             }
-            if let Some(payload) = normalize_rx_slice(&raw[..n]) {
-                self.record_trace(TraceDirection::In, 0x00, &payload);
-                if let Ok(decoded) = self.codec.decode(&payload) {
-                    self.state.apply_packet(&decoded);
-                    count += 1;
+            let Some(payload) = normalize_rx_slice(&raw[..read_len]) else {
+                continue;
+            };
+            self.record_trace(TraceDirection::In, 0x00, &payload);
+            if let Ok(decoded) = self.codec.decode(&payload) {
+                if matches!(decoded, DecodedPacket::RxAsyncBattery(_)) {
+                    self.last_battery_poll = Some(Instant::now());
                 }
+                self.state.apply_packet(&decoded);
+                processed += 1;
             }
         }
-        count
+        processed
     }
 
-    /// Queries whether the mouse MCU is awake/online. Always `true` on USB-C Wired.
     pub fn check_online(&mut self) -> Result<bool, DeviceError> {
         if self.info.mode == ConnectionMode::UsbWired {
             self.state.online = true;
@@ -176,16 +174,24 @@ impl Bkr1xDevice {
                 self.state.online = false;
                 Ok(false)
             }
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
-    /// Queries battery telemetry, falling back gracefully to cached state if the 2.4GHz MCU is asleep.
-    pub fn poll_battery(&mut self, min_interval: Duration) -> Result<BatteryTelemetry, DeviceError> {
+    fn ensure_awake(&mut self) -> Result<(), DeviceError> {
+        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
+            return Err(DeviceError::MouseAsleep);
+        }
+        Ok(())
+    }
+
+    pub fn poll_battery(
+        &mut self,
+        min_interval: Duration,
+    ) -> Result<BatteryTelemetry, DeviceError> {
         self.drain_async_events();
         if let Some(last) = self.last_battery_poll
             && last.elapsed() < min_interval
-            && self.state.battery.percent > 0
         {
             return Ok(self.state.battery);
         }
@@ -195,7 +201,11 @@ impl Bkr1xDevice {
         }
 
         let req = self.codec.encode_get_battery();
-        match self.transact(&req, Some(Opcode::GetBatteryInfo as u8), MAX_WIRELESS_RETRIES) {
+        match self.transact(
+            &req,
+            Some(Opcode::GetBatteryInfo as u8),
+            MAX_WIRELESS_RETRIES,
+        ) {
             Ok(rx) => {
                 let decoded = self.codec.decode(&rx)?;
                 self.state.apply_packet(&decoded);
@@ -206,11 +216,10 @@ impl Bkr1xDevice {
                 self.state.online = false;
                 Ok(self.state.battery)
             }
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
-    /// Queries firmware version (`X.Y.Z`).
     pub fn read_firmware_version(&mut self) -> Result<FirmwareVersion, DeviceError> {
         let req = self.codec.encode_get_firmware_version();
         let rx = self.transact(
@@ -223,11 +232,8 @@ impl Bkr1xDevice {
         Ok(self.state.firmware)
     }
 
-    /// Reads the active PAW3311 & MCU configuration block (`0x0E`).
     pub fn read_config(&mut self) -> Result<MouseConfig, DeviceError> {
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let req = self.codec.encode_get_mouse_config();
         let rx = self.transact(
             &req,
@@ -239,62 +245,43 @@ impl Bkr1xDevice {
         Ok(self.state.config)
     }
 
-    /// Validates and writes a new PAW3311 & MCU configuration block (`0x0F`) to flash.
     pub fn write_config(&mut self, cfg: &MouseConfig) -> Result<(), DeviceError> {
         cfg.validate()?;
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let req = self.codec.encode_set_mouse_config(cfg)?;
         let _ = self.transact(&req, None, MAX_WIRELESS_RETRIES)?;
         self.state.config = *cfg;
         Ok(())
     }
 
-    /// Writes the standalone LED mode (`0x21`).
     pub fn write_light_mode(&mut self, mode: LightMode) -> Result<(), DeviceError> {
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let req = self.codec.encode_set_light_mode(mode);
         let _ = self.transact(&req, None, MAX_WIRELESS_RETRIES)?;
         self.state.config.light_mode = mode;
         Ok(())
     }
 
-    /// Reads the 8 button mapping slots (`0x08`).
     pub fn read_buttons(&mut self) -> Result<ButtonMapping, DeviceError> {
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let req = self.codec.encode_get_mouse_keys();
-        let rx = self.transact(
-            &req,
-            Some(Opcode::GetMouseKeys as u8),
-            MAX_WIRELESS_RETRIES,
-        )?;
+        let rx = self.transact(&req, Some(Opcode::GetMouseKeys as u8), MAX_WIRELESS_RETRIES)?;
         let pkt = self.codec.decode(&rx)?;
         self.state.apply_packet(&pkt);
         Ok(self.state.buttons)
     }
 
-    /// Validates and writes all 8 button mapping slots (`0x09`).
     pub fn write_buttons(&mut self, buttons: &ButtonMapping) -> Result<(), DeviceError> {
         buttons.validate()?;
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let req = self.codec.encode_set_mouse_keys(buttons)?;
         let _ = self.transact(&req, None, MAX_WIRELESS_RETRIES)?;
         self.state.buttons = *buttons;
         Ok(())
     }
 
-    /// Compiles and streams a bank of hardware macros in 56-byte chunks (`0x0D`) + commit (`0x10`).
     pub fn write_macros(&mut self, macros: &[&[MacroStep]]) -> Result<usize, DeviceError> {
-        if self.info.mode == ConnectionMode::Wireless24Ghz && !self.check_online()? {
-            return Err(DeviceError::MouseAsleep);
-        }
+        self.ensure_awake()?;
         let mut flash = [0u8; MACRO_FLASH_TOTAL_LEN];
         let total_len = compile_macro_bank(macros, &mut flash)?;
 
@@ -313,10 +300,8 @@ impl Bkr1xDevice {
         Ok(total_len)
     }
 
-    /// Synchronizes full device state (online, firmware, battery, config, button mappings).
     pub fn sync_all(&mut self) -> Result<&HardwareStateMachine, DeviceError> {
-        let online = self.check_online()?;
-        if online {
+        if self.check_online()? {
             let _ = self.read_firmware_version();
             let _ = self.poll_battery(Duration::ZERO);
             let _ = self.read_config();
@@ -325,7 +310,6 @@ impl Bkr1xDevice {
         Ok(&self.state)
     }
 
-    /// Executes a single write + timeout-bounded read transaction with wireless backoff retries.
     fn transact(
         &mut self,
         report: &RawReport,
@@ -346,21 +330,23 @@ impl Bkr1xDevice {
                 if remaining.is_zero() {
                     break;
                 }
+                let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
                 let mut rx_raw = [0u8; WIRE_FRAME_LEN];
-                let n = self
-                    .device
-                    .read_timeout(&mut rx_raw, remaining.as_millis().max(1) as i32)?;
-                if n == 0 {
+                let read_len = self.device.read_timeout(&mut rx_raw, timeout_ms)?;
+                if read_len == 0 {
                     break;
                 }
-                let Some(payload) = normalize_rx_slice(&rx_raw[..n]) else {
+                let Some(payload) = normalize_rx_slice(&rx_raw[..read_len]) else {
                     continue;
                 };
                 self.record_trace(TraceDirection::In, 0x00, &payload);
 
-                // If an async battery/DPI event arrived mid-command, apply it and keep reading for our ACK
+                // Asynchronous battery/DPI push frames can interleave between TX and its ACK.
                 if payload[0] == RX_MAGIC && payload[1] == Opcode::AsyncTelemetry as u8 {
                     if let Ok(async_pkt) = self.codec.decode(&payload) {
+                        if matches!(async_pkt, DecodedPacket::RxAsyncBattery(_)) {
+                            self.last_battery_poll = Some(Instant::now());
+                        }
                         self.state.apply_packet(&async_pkt);
                     }
                     continue;
@@ -394,25 +380,19 @@ impl Bkr1xDevice {
         if self.trace_log.len() >= MAX_TRACE_ENTRIES {
             self.trace_log.pop_front();
         }
-        let ts_ms = SystemTime::now()
+        let timestamp_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|dur| dur.as_millis() as u64)
             .unwrap_or(0);
-        let summary = match self.codec.decode(payload) {
-            Ok(pkt) => format!("{pkt:?}"),
-            Err(_) => format!("RAW[0x{:02X}, 0x{:02X}]", payload[0], payload[1]),
-        };
         self.trace_log.push_back(WireTraceEntry {
-            timestamp_unix_ms: ts_ms,
+            timestamp_unix_ms,
             direction,
             report_id,
             payload: *payload,
-            summary,
         });
     }
 }
 
-/// Normalizes a `hidapi` read buffer (64 bytes raw or 65 bytes with leading ReportID `0x00`) into `[u8; 64]`.
 fn normalize_rx_slice(raw: &[u8]) -> Option<[u8; REPORT_PAYLOAD_LEN]> {
     if raw.is_empty() {
         return None;
@@ -427,12 +407,11 @@ fn normalize_rx_slice(raw: &[u8]) -> Option<[u8; REPORT_PAYLOAD_LEN]> {
     Some(out)
 }
 
-/// Inspects `HidApi::device_list()` to safely select ONLY the Vendor-Defined collection (`0xFF00..=0xFFFF`).
 pub fn discover_best_interface(
     api: &HidApi,
     rules: &[DeviceIdRule],
 ) -> Result<DiscoveredInterface, DeviceError> {
-    let mut candidates: Vec<(u8, DiscoveredInterface)> = Vec::new();
+    let mut best: Option<(u8, DiscoveredInterface)> = None;
     let mut saw_bluetooth_bkr1x = false;
 
     for dev in api.device_list() {
@@ -447,65 +426,72 @@ pub fn discover_best_interface(
             continue;
         };
 
-        let up = dev.usage_page();
+        let usage_page = dev.usage_page();
         let usage = dev.usage();
 
-        // CRITICAL SAFETY FILTER: Never claim Generic Desktop (0x0001) or Consumer (0x000C) interfaces!
-        // On Linux, hidraw sometimes reports 0/0 when sysfs usage parsing isn't populated on older kernels;
-        // if up != 0, enforce strictly `0xFF00..=0xFFFF`.
-        if up != 0 && !(VENDOR_USAGE_PAGE_MIN..=VENDOR_USAGE_PAGE_MAX).contains(&up) {
+        // Never open Generic Desktop (0x0001) or Consumer (0x000C) collections, which would lock
+        // OS cursor/media input. Older Linux kernels may report `usage_page == 0` via hidraw sysfs;
+        // in that case skip USB interface 0 (always the composite boot mouse interface).
+        if usage_page != 0 && !(VENDOR_USAGE_PAGE_MIN..=VENDOR_USAGE_PAGE_MAX).contains(&usage_page)
+        {
             continue;
         }
         #[cfg(target_os = "linux")]
-        if up == 0 && dev.interface_number() == 0 {
-            // Interface 0 on USB composite mice is always the boot mouse cursor collection; skip it!
+        if usage_page == 0 && dev.interface_number() == 0 {
             continue;
         }
 
-        // Rank exact UsagePage 0xFF01 + Usage 0x0010 + Wired mode highest
-        let mut priority = 10u8;
-        if up == VENDOR_USAGE_PAGE_BKR1X && usage == VENDOR_USAGE_BKR1X {
-            priority = 0;
-        } else if up == VENDOR_USAGE_PAGE_BKR1X {
-            priority = 2;
-        }
-        if rule.mode == ConnectionMode::Wireless24Ghz {
-            priority += 1; // Prefer USB-C Wired when both cable and dongle are connected
-        }
+        let base_rank = if usage_page == VENDOR_USAGE_PAGE_BKR1X && usage == VENDOR_USAGE_BKR1X {
+            0u8
+        } else if usage_page == VENDOR_USAGE_PAGE_BKR1X {
+            2u8
+        } else {
+            10u8
+        };
+        // Prefer USB-C Wired over 2.4GHz Dongle when both are plugged in simultaneously.
+        let priority = base_rank + u8::from(rule.mode == ConnectionMode::Wireless24Ghz);
 
-        candidates.push((
-            priority,
-            DiscoveredInterface {
-                path: dev.path().to_owned(),
-                vendor_id: dev.vendor_id(),
-                product_id: dev.product_id(),
-                usage_page: up,
-                usage,
-                product_name: dev.product_string().unwrap_or("BK-R1X").to_owned(),
-                mode: rule.mode,
-            },
-        ));
+        if best
+            .as_ref()
+            .is_none_or(|(best_prio, _)| priority < *best_prio)
+        {
+            best = Some((
+                priority,
+                DiscoveredInterface {
+                    path: dev.path().to_owned(),
+                    vendor_id: dev.vendor_id(),
+                    product_id: dev.product_id(),
+                    usage_page,
+                    usage,
+                    product_name: dev.product_string().unwrap_or("BK-R1X").to_owned(),
+                    mode: rule.mode,
+                },
+            ));
+        }
     }
 
-    candidates.sort_by_key(|(prio, _)| *prio);
-    if let Some((_, best)) = candidates.into_iter().next() {
-        return Ok(best);
+    if let Some((_, chosen)) = best {
+        return Ok(chosen);
     }
-
     if saw_bluetooth_bkr1x {
         return Err(DeviceError::BluetoothConfigUnsupported);
     }
-
     Err(DeviceError::NotFound)
 }
 
 fn is_bluetooth_bkr1x_candidate(dev: &DeviceInfo, rules: &[DeviceIdRule]) -> bool {
-    let prod = dev.product_string().unwrap_or("").to_ascii_uppercase();
-    let name_matches = prod.contains("BK-R1X") || prod.contains("BKR1X");
+    let prod = dev.product_string().unwrap_or("");
+    let name_matches =
+        contains_ignore_ascii_case(prod, "BK-R1X") || contains_ignore_ascii_case(prod, "BKR1X");
     let vid_matches = rules.iter().any(|r| r.vendor_id == dev.vendor_id());
     let is_standard_mouse = dev.usage_page() == 0x0001 && dev.usage() == 0x0002;
 
-    // Bluetooth HOGP exposes standard HID mouse (0x0001:0x0002) without any 0xFF01 vendor collection
-    (name_matches && (dev.usage_page() < VENDOR_USAGE_PAGE_MIN))
+    (name_matches && dev.usage_page() < VENDOR_USAGE_PAGE_MIN)
         || (vid_matches && is_standard_mouse && dev.interface_number() < 0)
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    n.is_empty() || h.windows(n.len()).any(|win| win.eq_ignore_ascii_case(n))
 }

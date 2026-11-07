@@ -1,6 +1,4 @@
 #![no_std]
-//! `#![no_std]` zero-heap-allocation HID protocol engine for the **Fire Phoenix BK-R1X**
-//! wireless gaming mouse (PixArt PAW3311 sensor, YJX2012 OEM MCU).
 
 pub mod checksum;
 pub mod codec;
@@ -23,34 +21,33 @@ mod tests {
         let rpt = codec.encode_set_mouse_config(&cfg).unwrap();
         let wire = rpt.to_wire_bytes();
 
-        // Exact byte offsets from app/page-51c144502f8589f3.js `setMouseConfigData`
-        assert_eq!(wire[0], 0x00); // Report ID
-        assert_eq!(wire[1], 0x55); // TX_MAGIC (85)
-        assert_eq!(wire[2], 0x0F); // Opcode 15
-        assert_eq!(wire[3], 0xAE); // 174
-        assert_eq!(wire[4], 0x0A); // 10
-        assert_eq!(wire[5], 0x2F); // 47
+        assert_eq!(wire[0], 0x00);
+        assert_eq!(wire[1], 0x55);
+        assert_eq!(wire[2], 0x0F);
+        assert_eq!(wire[3], 0xAE);
+        assert_eq!(wire[4], 0x0A);
+        assert_eq!(wire[5], 0x2F);
         assert_eq!(wire[6], 0x01);
         assert_eq!(wire[7], 0x01);
-        assert_eq!(wire[10], 2); // Neon light mode
-        assert_eq!(wire[11], 4); // 1000Hz -> report_rate(3) + 1 = 4
-        assert_eq!(wire[12], 6); // dpi_count
-        assert_eq!(wire[13], 3); // active_dpi_stage(2) + 1 = 3 (1600 DPI)
+        assert_eq!(wire[10], 2);
+        assert_eq!(wire[11], 4);
+        assert_eq!(wire[12], 6);
+        assert_eq!(wire[13], 3);
         assert_eq!(u16::from_le_bytes([wire[14], wire[15]]), 800);
         assert_eq!(u16::from_le_bytes([wire[18], wire[19]]), 1600);
         assert_eq!(u16::from_le_bytes([wire[24], wire[25]]), 18000);
-        assert_eq!(wire[50], 1); // LOD 1mm
-        assert_eq!(wire[51], 53); // sensor_flag (MotionSync | AngleSnap | Ripple | 0x04)
-        assert_eq!(wire[52], 2); // key_respond debounce
-        assert_eq!(wire[53], 10); // sleep_light 10 min
-        assert_eq!(wire[55], 0x11); // wakeup(1)<<4 | move_light(1)
+        assert_eq!(wire[50], 1);
+        assert_eq!(wire[51], 53);
+        assert_eq!(wire[52], 2);
+        assert_eq!(wire[53], 10);
+        assert_eq!(wire[55], 0x11);
 
         let decoded = codec.decode(&wire).unwrap();
         assert_eq!(decoded, DecodedPacket::TxSetMouseConfig(cfg));
     }
 
     #[test]
-    fn paw3311_bounds_validation_rejects_out_of_range_values() {
+    fn paw3311_bounds_validation_checks_enabled_stages_only() {
         let mut cfg = MouseConfig::factory_default();
         cfg.dpi_stages[0] = 25_000;
         assert_eq!(
@@ -61,7 +58,7 @@ mod tests {
             })
         );
 
-        cfg.dpi_stages[0] = 1623; // Not aligned to 50 DPI step
+        cfg.dpi_stages[0] = 1623;
         assert_eq!(
             cfg.validate(),
             Err(ProtocolError::InvalidDpi {
@@ -70,7 +67,11 @@ mod tests {
             })
         );
 
-        cfg.dpi_stages[0] = 1600;
+        cfg.dpi_count = 2;
+        cfg.active_dpi_stage = 1;
+        cfg.dpi_stages = [800, 1600, 0, 0, 0, 0];
+        assert!(cfg.validate().is_ok());
+
         cfg.debounce_ms = 45;
         assert_eq!(cfg.validate(), Err(ProtocolError::InvalidDebounceMs(45)));
     }
@@ -95,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn macro_compiler_matches_oem_binary_layout() {
+    fn macro_compiler_matches_oem_binary_layout_and_guards_slot_overflow() {
         let steps = [
             MacroStep {
-                input: MacroInput::KeyboardKey(0x04), // 'A'
+                input: MacroInput::KeyboardKey(0x04),
                 pressed: true,
                 delay_ms: 10,
             },
@@ -112,8 +113,13 @@ mod tests {
         let used = compile_macro_bank(&[&steps], &mut flash).unwrap();
         assert_eq!(used, 64 + 8);
         assert_eq!(u16::from_le_bytes([flash[0], flash[1]]), 64);
-        assert_eq!(&flash[64..68], &[10, 0, 0x42, 0x04]); // Press + Keyboard(2)
-        assert_eq!(&flash[68..72], &[15, 0, 0x82, 0x04]); // Last(0x80) + Release + Keyboard(2)
+        assert_eq!(&flash[64..68], &[10, 0, 0x42, 0x04]);
+        assert_eq!(&flash[68..72], &[15, 0, 0x82, 0x04]);
+
+        let oversized: [&[MacroStep]; 256] = [&[]; 256];
+        assert_eq!(
+            compile_macro_bank(&oversized, &mut flash),
+            Err(ProtocolError::InvalidMacroSlot(u8::MAX))
+        );
     }
 }
-

@@ -1,11 +1,3 @@
-//! `bkr1x-installer` — Standalone 1-click native Setup Wizard & Uninstaller for GitHub Releases.
-//!
-//! Double-clicking `BKR1X-Setup-vX.Y.Z-x64.exe` opens a zero-UAC-prompt dark-themed Setup Wizard
-//! that extracts `bkr1x-daemon.exe`, `bkr1x-gui.exe`, and `bkr1x-cli.exe` into
-//! `%LOCALAPPDATA%\Programs\BKR1X`, registers Windows Startup, Start Menu / Desktop shortcuts,
-//! and Windows Settings -> Installed Apps (`Uninstall BK-R1X.exe`), then launches the System Tray
-//! and Configurator UI in a single click.
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
@@ -32,13 +24,29 @@ const ACCENT_GREEN: Color32 = Color32::from_rgb(158, 206, 106);
 const ACCENT_RED: Color32 = Color32::from_rgb(247, 118, 142);
 const TEXT_MUTED: Color32 = Color32::from_rgb(150, 158, 188);
 
-#[derive(Debug, Clone)]
+const DEFAULT_WIZARD_ICON_STATUS: TrayIconStatus = TrayIconStatus {
+    connected: true,
+    online: true,
+    battery_percent: 100,
+    charging: true,
+};
+
+#[derive(Debug)]
 enum WizardStage {
     Ready,
-    Working { label: String },
+    Working { label: &'static str },
     Installed(InstallSummary),
     Uninstalled,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardAction {
+    None,
+    StartInstall,
+    StartUninstall,
+    ResetReady,
+    CloseWindow,
 }
 
 enum TaskOutcome {
@@ -61,15 +69,7 @@ impl SetupWizardApp {
     fn new(cc: &eframe::CreationContext<'_>, uninstall_mode: bool) -> Self {
         configure_wizard_theme(&cc.egui_ctx);
 
-        let logo_rgba = render_mouse_icon_rgba(
-            64,
-            TrayIconStatus {
-                connected: true,
-                online: true,
-                battery_percent: 100,
-                charging: true,
-            },
-        );
+        let logo_rgba = render_mouse_icon_rgba(64, DEFAULT_WIZARD_ICON_STATUS);
         let color_image = egui::ColorImage::from_rgba_unmultiplied([64, 64], &logo_rgba);
         let logo_texture = Some(cc.egui_ctx.load_texture(
             "bkr1x-setup-logo",
@@ -98,10 +98,10 @@ impl SetupWizardApp {
         let egui_ctx = ctx.clone();
 
         self.stage = WizardStage::Working {
-            label: "Extracting native binaries & registering Windows shortcuts...".to_owned(),
+            label: "Extracting native binaries & registering Windows shortcuts...",
         };
 
-        let _ = thread::Builder::new()
+        if let Err(err) = thread::Builder::new()
             .name("bkr1x-setup-worker".to_owned())
             .spawn(move || {
                 let res = install_with_options(&opts);
@@ -113,7 +113,10 @@ impl SetupWizardApp {
                 }
                 let _ = tx.send(TaskOutcome::Installed(res));
                 egui_ctx.request_repaint();
-            });
+            })
+        {
+            self.stage = WizardStage::Failed(format!("failed spawning setup worker: {err}"));
+        }
     }
 
     fn start_uninstall(&mut self, ctx: &egui::Context) {
@@ -121,16 +124,19 @@ impl SetupWizardApp {
         let egui_ctx = ctx.clone();
 
         self.stage = WizardStage::Working {
-            label: "Stopping System Tray agent & removing shortcuts...".to_owned(),
+            label: "Stopping System Tray agent & removing shortcuts...",
         };
 
-        let _ = thread::Builder::new()
+        if let Err(err) = thread::Builder::new()
             .name("bkr1x-uninst-worker".to_owned())
             .spawn(move || {
                 let res = uninstall_user_application_full(true);
                 let _ = tx.send(TaskOutcome::Uninstalled(res));
                 egui_ctx.request_repaint();
-            });
+            })
+        {
+            self.stage = WizardStage::Failed(format!("failed spawning uninstall worker: {err}"));
+        }
     }
 
     fn poll_worker(&mut self) {
@@ -153,60 +159,210 @@ impl SetupWizardApp {
             }
         }
     }
+
+    fn render_header(&self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(PANEL_BG)
+            .stroke(Stroke::new(1.0_f32, CARD_BORDER))
+            .corner_radius(10.0)
+            .inner_margin(14.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(ref tex) = self.logo_texture {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(48.0, 48.0)));
+                        ui.add_space(10.0);
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Fire Phoenix BK-R1X")
+                                .size(19.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "v{} · Native PAW3311 Driver, System Tray & GUI (< 2 MB RAM)",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(12.0)
+                            .color(ACCENT_CYAN),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn render_install_options(&mut self, ui: &mut egui::Ui) -> WizardAction {
+        let dest = user_install_dir();
+        egui::Frame::new()
+            .fill(PANEL_BG)
+            .stroke(Stroke::new(1.0_f32, CARD_BORDER))
+            .corner_radius(10.0)
+            .inner_margin(14.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("Destination: {}", dest.display()))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+                ui.label(
+                    RichText::new(
+                        "Per-user installation — no Administrator / UAC prompt required.",
+                    )
+                    .size(11.5)
+                    .color(TEXT_MUTED),
+                );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.checkbox(
+                    &mut self.opts.enable_autostart,
+                    "Launch System Tray icon automatically when Windows starts",
+                );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.opts.create_start_menu_shortcut,
+                    "Create Windows Start Menu shortcut",
+                );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.opts.create_desktop_shortcut,
+                    "Create Desktop shortcut",
+                );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.launch_after_install,
+                    "Start System Tray & open BK-R1X Configurator now",
+                );
+            });
+
+        ui.add_space(16.0);
+        let mut action = WizardAction::None;
+        ui.horizontal(|ui| {
+            let primary_label = if self.already_installed {
+                "Update / Reinstall BK-R1X"
+            } else {
+                "Install Fire Phoenix BK-R1X"
+            };
+
+            if ui
+                .add_sized(
+                    [250.0, 38.0],
+                    egui::Button::new(
+                        RichText::new(primary_label)
+                            .size(14.0)
+                            .strong()
+                            .color(Color32::from_rgb(16, 18, 26)),
+                    )
+                    .fill(ACCENT_BLUE),
+                )
+                .clicked()
+            {
+                action = WizardAction::StartInstall;
+            }
+
+            if self.already_installed
+                && ui
+                    .add_sized(
+                        [110.0, 38.0],
+                        egui::Button::new(RichText::new("Uninstall").color(ACCENT_RED)),
+                    )
+                    .clicked()
+            {
+                action = WizardAction::StartUninstall;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_sized([90.0, 38.0], egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    action = WizardAction::CloseWindow;
+                }
+            });
+        });
+        action
+    }
+
+    fn render_uninstall_confirm(&self, ui: &mut egui::Ui) -> WizardAction {
+        egui::Frame::new()
+            .fill(PANEL_BG)
+            .stroke(Stroke::new(1.0_f32, CARD_BORDER))
+            .corner_radius(10.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Remove Fire Phoenix BK-R1X from your computer?")
+                        .size(15.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "This stops the background System Tray agent, removes the Windows Startup \
+                         and Installed Apps entries, and deletes installed binaries.\n\
+                         Your saved mouse profiles in %APPDATA%\\bkr1x\\profiles are preserved.",
+                    )
+                    .color(TEXT_MUTED),
+                );
+            });
+
+        ui.add_space(18.0);
+        let mut action = WizardAction::None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_sized(
+                    [220.0, 38.0],
+                    egui::Button::new(
+                        RichText::new("Uninstall BK-R1X")
+                            .size(14.0)
+                            .strong()
+                            .color(Color32::from_rgb(20, 14, 18)),
+                    )
+                    .fill(ACCENT_RED),
+                )
+                .clicked()
+            {
+                action = WizardAction::StartUninstall;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_sized([100.0, 38.0], egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    action = WizardAction::CloseWindow;
+                }
+            });
+        });
+        action
+    }
 }
 
 impl eframe::App for SetupWizardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
 
+        let mut action = WizardAction::None;
+
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(20.0))
             .show(ctx, |ui| {
-                // Header card
-                egui::Frame::new()
-                    .fill(PANEL_BG)
-                    .stroke(Stroke::new(1.0_f32, CARD_BORDER))
-                    .corner_radius(10.0)
-                    .inner_margin(14.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if let Some(ref tex) = self.logo_texture {
-                                ui.add(
-                                    egui::Image::new(tex)
-                                        .fit_to_exact_size(egui::vec2(48.0, 48.0)),
-                                );
-                                ui.add_space(10.0);
-                            }
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("Fire Phoenix BK-R1X")
-                                        .size(19.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                );
-                                ui.label(
-                                    RichText::new(format!(
-                                        "v{} · Native PAW3311 Driver, System Tray & GUI (< 2 MB RAM)",
-                                        env!("CARGO_PKG_VERSION")
-                                    ))
-                                    .size(12.0)
-                                    .color(ACCENT_CYAN),
-                                );
-                            });
-                        });
-                    });
-
+                self.render_header(ui);
                 ui.add_space(14.0);
 
-                match &self.stage.clone() {
+                match &self.stage {
                     WizardStage::Ready => {
-                        if self.uninstall_mode {
-                            self.render_uninstall_confirm(ui, ctx);
+                        action = if self.uninstall_mode {
+                            self.render_uninstall_confirm(ui)
                         } else {
-                            self.render_install_options(ui, ctx);
-                        }
+                            self.render_install_options(ui)
+                        };
                     }
                     WizardStage::Working { label } => {
+                        let label = *label;
                         egui::Frame::new()
                             .fill(PANEL_BG)
                             .stroke(Stroke::new(1.0_f32, CARD_BORDER))
@@ -271,7 +427,7 @@ impl eframe::App for SetupWizardApp {
                                 )
                                 .clicked()
                             {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                action = WizardAction::CloseWindow;
                             }
                         });
                     }
@@ -301,7 +457,7 @@ impl eframe::App for SetupWizardApp {
                                 .add_sized([130.0, 36.0], egui::Button::new("Close"))
                                 .clicked()
                             {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                action = WizardAction::CloseWindow;
                             }
                         });
                     }
@@ -325,159 +481,23 @@ impl eframe::App for SetupWizardApp {
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
                             if ui.button("Back").clicked() {
-                                self.stage = WizardStage::Ready;
+                                action = WizardAction::ResetReady;
                             }
                             if ui.button("Close").clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                action = WizardAction::CloseWindow;
                             }
                         });
                     }
                 }
             });
-    }
-}
 
-impl SetupWizardApp {
-    fn render_install_options(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let dest = user_install_dir();
-        egui::Frame::new()
-            .fill(PANEL_BG)
-            .stroke(Stroke::new(1.0_f32, CARD_BORDER))
-            .corner_radius(10.0)
-            .inner_margin(14.0)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("Destination: {}", dest.display()))
-                        .size(12.0)
-                        .color(TEXT_MUTED),
-                );
-                ui.label(
-                    RichText::new("Per-user installation — no Administrator / UAC prompt required.")
-                        .size(11.5)
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.checkbox(
-                    &mut self.opts.enable_autostart,
-                    "Launch System Tray icon automatically when Windows starts",
-                );
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut self.opts.create_start_menu_shortcut,
-                    "Create Windows Start Menu shortcut",
-                );
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut self.opts.create_desktop_shortcut,
-                    "Create Desktop shortcut",
-                );
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut self.launch_after_install,
-                    "Start System Tray & open BK-R1X Configurator now",
-                );
-            });
-
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            let primary_label = if self.already_installed {
-                "Update / Reinstall BK-R1X"
-            } else {
-                "Install Fire Phoenix BK-R1X"
-            };
-
-            if ui
-                .add_sized(
-                    [250.0, 38.0],
-                    egui::Button::new(
-                        RichText::new(primary_label)
-                            .size(14.0)
-                            .strong()
-                            .color(Color32::from_rgb(16, 18, 26)),
-                    )
-                    .fill(ACCENT_BLUE),
-                )
-                .clicked()
-            {
-                self.start_install(ctx);
-            }
-
-            if self.already_installed
-                && ui
-                    .add_sized(
-                        [110.0, 38.0],
-                        egui::Button::new(RichText::new("Uninstall").color(ACCENT_RED)),
-                    )
-                    .clicked()
-            {
-                self.start_uninstall(ctx);
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized([90.0, 38.0], egui::Button::new("Cancel"))
-                    .clicked()
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
-    }
-
-    fn render_uninstall_confirm(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::Frame::new()
-            .fill(PANEL_BG)
-            .stroke(Stroke::new(1.0_f32, CARD_BORDER))
-            .corner_radius(10.0)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Remove Fire Phoenix BK-R1X from your computer?")
-                        .size(15.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "This stops the background System Tray agent, removes the Windows Startup \
-                         and Installed Apps entries, and deletes installed binaries.\n\
-                         Your saved mouse profiles in %APPDATA%\\bkr1x\\profiles are preserved.",
-                    )
-                    .color(TEXT_MUTED),
-                );
-            });
-
-        ui.add_space(18.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    [220.0, 38.0],
-                    egui::Button::new(
-                        RichText::new("Uninstall BK-R1X")
-                            .size(14.0)
-                            .strong()
-                            .color(Color32::from_rgb(20, 14, 18)),
-                    )
-                    .fill(ACCENT_RED),
-                )
-                .clicked()
-            {
-                self.start_uninstall(ctx);
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized([100.0, 38.0], egui::Button::new("Cancel"))
-                    .clicked()
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
+        match action {
+            WizardAction::None => {}
+            WizardAction::StartInstall => self.start_install(ctx),
+            WizardAction::StartUninstall => self.start_uninstall(ctx),
+            WizardAction::ResetReady => self.stage = WizardStage::Ready,
+            WizardAction::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
     }
 }
 
@@ -512,15 +532,19 @@ fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
 
     cmd.spawn()
         .map(|_| ())
-        .map_err(|e| format!("failed launching {}: {e}", exe.display()))
+        .map_err(|err| format!("failed launching {}: {err}", exe.display()))
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let silent = args.iter().any(|a| a == "--silent" || a == "/S" || a == "/quiet");
-    let uninstall_mode = args
-        .iter()
-        .any(|a| a == "--uninstall" || a == "/uninstall" || a == "/U");
+    let mut silent = false;
+    let mut uninstall_mode = false;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--silent" | "/S" | "/quiet" => silent = true,
+            "--uninstall" | "/uninstall" | "/U" => uninstall_mode = true,
+            _ => {}
+        }
+    }
 
     if silent {
         let res = if uninstall_mode {
@@ -536,15 +560,7 @@ fn main() -> ExitCode {
         };
     }
 
-    let icon_rgba = render_mouse_icon_rgba(
-        64,
-        TrayIconStatus {
-            connected: true,
-            online: true,
-            battery_percent: 100,
-            charging: true,
-        },
-    );
+    let icon_rgba = render_mouse_icon_rgba(64, DEFAULT_WIZARD_ICON_STATUS);
     let app_icon = egui::IconData {
         rgba: icon_rgba,
         width: 64,
