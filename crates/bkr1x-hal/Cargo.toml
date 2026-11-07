@@ -1,0 +1,16 @@
+[package]
+name = "bkr1x-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform HID Hardware Abstraction Layer, profile loader, and IPC transport for the Fire Phoenix BK-R1X mouse"
+
+[dependencies]
+bkr1x-protocol.workspace = true
+hidapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

@@ -1,0 +1,12 @@
+# Fire Phoenix BK-R1X Wireless Gaming Mouse (YJX2012 MCU + PixArt PAW3311)
+# Grants non-root desktop seat users (`uaccess`) direct hidraw access.
+#
+# Install:
+#   sudo cp dist/linux/99-bkr1x-hidraw.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# BK-R1X — USB-C Wired Mode (VID 0xA8A4, PID 0x2255)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="a8a4", ATTRS{idProduct}=="2255", MODE="0660", TAG+="uaccess"
+
+# BK-R1X — 2.4GHz Wireless Receiver Dongle (VID 0xA8A5, PID 0x2255)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="a8a5", ATTRS{idProduct}=="2255", MODE="0660", TAG+="uaccess"

@@ -1,0 +1,81 @@
+//! Standard USB HID Keyboard/Keypad Page (`0x07`) keycode lookup table for shortcuts & macros.
+
+pub struct HidKeyEntry {
+    pub code: u8,
+    pub label: &'static str,
+}
+
+pub const HID_KEY_TABLE: &[HidKeyEntry] = &[
+    HidKeyEntry { code: 0x04, label: "A" },
+    HidKeyEntry { code: 0x05, label: "B" },
+    HidKeyEntry { code: 0x06, label: "C" },
+    HidKeyEntry { code: 0x07, label: "D" },
+    HidKeyEntry { code: 0x08, label: "E" },
+    HidKeyEntry { code: 0x09, label: "F" },
+    HidKeyEntry { code: 0x0A, label: "G" },
+    HidKeyEntry { code: 0x0B, label: "H" },
+    HidKeyEntry { code: 0x0C, label: "I" },
+    HidKeyEntry { code: 0x0D, label: "J" },
+    HidKeyEntry { code: 0x0E, label: "K" },
+    HidKeyEntry { code: 0x0F, label: "L" },
+    HidKeyEntry { code: 0x10, label: "M" },
+    HidKeyEntry { code: 0x11, label: "N" },
+    HidKeyEntry { code: 0x12, label: "O" },
+    HidKeyEntry { code: 0x13, label: "P" },
+    HidKeyEntry { code: 0x14, label: "Q" },
+    HidKeyEntry { code: 0x15, label: "R" },
+    HidKeyEntry { code: 0x16, label: "S" },
+    HidKeyEntry { code: 0x17, label: "T" },
+    HidKeyEntry { code: 0x18, label: "U" },
+    HidKeyEntry { code: 0x19, label: "V" },
+    HidKeyEntry { code: 0x1A, label: "W" },
+    HidKeyEntry { code: 0x1B, label: "X" },
+    HidKeyEntry { code: 0x1C, label: "Y" },
+    HidKeyEntry { code: 0x1D, label: "Z" },
+    HidKeyEntry { code: 0x1E, label: "1" },
+    HidKeyEntry { code: 0x1F, label: "2" },
+    HidKeyEntry { code: 0x20, label: "3" },
+    HidKeyEntry { code: 0x21, label: "4" },
+    HidKeyEntry { code: 0x22, label: "5" },
+    HidKeyEntry { code: 0x23, label: "6" },
+    HidKeyEntry { code: 0x24, label: "7" },
+    HidKeyEntry { code: 0x25, label: "8" },
+    HidKeyEntry { code: 0x26, label: "9" },
+    HidKeyEntry { code: 0x27, label: "0" },
+    HidKeyEntry { code: 0x28, label: "Enter" },
+    HidKeyEntry { code: 0x29, label: "Escape" },
+    HidKeyEntry { code: 0x2A, label: "Backspace" },
+    HidKeyEntry { code: 0x2B, label: "Tab" },
+    HidKeyEntry { code: 0x2C, label: "Space" },
+    HidKeyEntry { code: 0x3A, label: "F1" },
+    HidKeyEntry { code: 0x3B, label: "F2" },
+    HidKeyEntry { code: 0x3C, label: "F3" },
+    HidKeyEntry { code: 0x3D, label: "F4" },
+    HidKeyEntry { code: 0x3E, label: "F5" },
+    HidKeyEntry { code: 0x3F, label: "F6" },
+    HidKeyEntry { code: 0x40, label: "F7" },
+    HidKeyEntry { code: 0x41, label: "F8" },
+    HidKeyEntry { code: 0x42, label: "F9" },
+    HidKeyEntry { code: 0x43, label: "F10" },
+    HidKeyEntry { code: 0x44, label: "F11" },
+    HidKeyEntry { code: 0x45, label: "F12" },
+    HidKeyEntry { code: 0x46, label: "PrintScreen" },
+    HidKeyEntry { code: 0x49, label: "Insert" },
+    HidKeyEntry { code: 0x4A, label: "Home" },
+    HidKeyEntry { code: 0x4B, label: "PageUp" },
+    HidKeyEntry { code: 0x4C, label: "Delete" },
+    HidKeyEntry { code: 0x4D, label: "End" },
+    HidKeyEntry { code: 0x4E, label: "PageDown" },
+    HidKeyEntry { code: 0x4F, label: "Right Arrow" },
+    HidKeyEntry { code: 0x50, label: "Left Arrow" },
+    HidKeyEntry { code: 0x51, label: "Down Arrow" },
+    HidKeyEntry { code: 0x52, label: "Up Arrow" },
+];
+
+pub fn keycode_label(code: u8) -> &'static str {
+    HID_KEY_TABLE
+        .iter()
+        .find(|e| e.code == code)
+        .map(|e| e.label)
+        .unwrap_or("Key")
+}

@@ -1,0 +1,19 @@
+[package]
+name = "bkr1x-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ultra-lightweight (<2MB RSS, 0% idle CPU) background telemetry, IPC, and per-app profile daemon for the Fire Phoenix BK-R1X"
+
+[[bin]]
+name = "bkr1x-daemon"
+path = "src/main.rs"
+
+[dependencies]
+bkr1x-protocol.workspace = true
+bkr1x-hal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

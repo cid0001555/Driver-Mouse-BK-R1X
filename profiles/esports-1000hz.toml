@@ -1,0 +1,39 @@
+name = "BK-R1X Esports 1000Hz Low-Latency"
+# Optional: auto-apply when bkr1x-daemon detects this foreground process
+# match_process = "cs2"
+
+[sensor]
+dpi_stages = [400, 800, 1600, 3200]
+active_stage = 3
+polling_rate_hz = 1000
+lod_mm = 1
+debounce_ms = 2
+motion_sync = true
+angle_snapping = false
+ripple_control = false
+reverse_scroll = false
+highspeed_mode = true
+
+[power_lighting]
+sleep_minutes = 10
+light_mode = "off"
+wakeup_on_move = true
+move_lights_off = true
+
+[buttons]
+left = "left"
+right = "right"
+middle = "middle"
+back = "back"
+forward = "forward"
+dpi_loop = "dpi_loop"
+scroll_up = "scroll_up"
+scroll_down = "scroll_down"
+
+[[macros]]
+name = "Quick Jump-Throw"
+steps = [
+  { kind = "key", code = 44, pressed = true, delay_ms = 12 },
+  { kind = "mouse", code = 1, pressed = false, delay_ms = 10 },
+  { kind = "key", code = 44, pressed = false, delay_ms = 10 },
+]

@@ -1,0 +1,8 @@
+[package]
+name = "bkr1x-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-allocation #![no_std] HID wire protocol, checksum engine, and PAW3311 state machine for the Fire Phoenix BK-R1X gaming mouse"
+
+[dependencies]
