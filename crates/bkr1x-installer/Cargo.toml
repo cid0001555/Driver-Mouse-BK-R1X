@@ -1,0 +1,20 @@
+[package]
+name = "bkr1x-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone 1-click native Windows Setup Wizard & Uninstaller for the Fire Phoenix BK-R1X driver"
+
+[[bin]]
+name = "bkr1x-installer"
+path = "src/main.rs"
+
+[dependencies]
+bkr1x-hal.workspace = true
+eframe.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

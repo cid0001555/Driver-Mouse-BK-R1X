@@ -20,6 +20,7 @@ Ultra-lightweight (< 2 MB background RSS, 0.0% idle CPU) native Rust driver suit
 - **`crates/bkr1x-daemon`**: Silent background service & native Windows System Tray ("taskbar notification area") host (`#![windows_subsystem = "windows"]`, pure Win32 `Shell_NotifyIconW`, `0.0%` idle CPU) exposing sub-millisecond JSON-line IPC (`/run/user/$UID/bkr1x.sock` on Linux, `\\.\pipe\bkr1x-daemon` on Windows) and automatic per-game profile switching.
 - **`crates/bkr1x-cli`**: Fast CLI for user-profile installation (`install` / `uninstall` / `tray`), telemetry queries, direct sensor configuration, TOML/JSON profile flashing, raw hex packet verification, and static JS bundle scanning.
 - **`crates/bkr1x-gui`**: On-demand reactive dark-themed native configurator built on `eframe` / `egui` (`glow` OpenGL backend) with `0.0%` idle CPU, G HUB-style **Profiles & Startup** manager, and a real-time Raw HID Wire Debugger. Exiting the window frees 100% of OpenGL/GPU memory while `bkr1x-daemon` stays resident in the taskbar tray.
+- **`crates/bkr1x-installer`**: Self-contained 1-click native Windows Setup Wizard & Uninstaller (`BKR1X-Setup-v0.1.0-x64.exe`) for GitHub Releases—zero UAC prompt, registers Windows Startup, Start Menu/Desktop shortcuts, and Windows *Settings -> Installed apps*.
 - **`tools/`**: WebHID Tampermonkey/DevTools sniffer (`bkr1x-webhid-sniffer.user.js`) and static JS bundle extractor (`analyze_bundle.py`).
 - **`dist/linux/`**: Userspace `udev` rules (`99-bkr1x-hidraw.rules`) and `systemd --user` service unit (`bkr1x-daemon.service`).
 
@@ -35,8 +36,11 @@ Like Logitech G HUB—without the 400 MB Electron/CEF overhead—`bkr1x-daemon.e
 # Build stripped fat-LTO release binaries
 cargo build --release --workspace
 
-# Install into %LOCALAPPDATA%\Programs\BKR1X, add Start Menu shortcut,
-# register Windows login auto-start, and start the System Tray icon immediately:
+# Package a standalone single-file 1-Click Setup Wizard (.exe) for GitHub Releases:
+.\target\release\bkr1x-cli.exe package-installer
+# -> Outputs dist\windows\BKR1X-Setup-v0.1.0-x64.exe
+
+# Or install directly from a local build:
 .\target\release\bkr1x-cli.exe install
 
 # Manage tray & startup from CLI anytime:

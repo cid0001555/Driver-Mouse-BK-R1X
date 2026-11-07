@@ -198,11 +198,22 @@ name = "bkr1x-hal"
 version = "0.1.0"
 dependencies = [
  "bkr1x-protocol",
+ "flate2",
  "hidapi",
  "serde",
  "serde_json",
  "toml 0.8.23",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "bkr1x-installer"
+version = "0.1.0"
+dependencies = [
+ "bkr1x-hal",
+ "eframe",
+ "windows-sys 0.59.0",
+ "winresource",
 ]
 
 [[package]]

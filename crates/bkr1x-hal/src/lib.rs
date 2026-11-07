@@ -7,6 +7,7 @@ pub mod error;
 pub mod icon;
 pub mod ipc;
 pub mod profile;
+pub mod sfx;
 pub mod startup;
 
 pub use device::{
@@ -20,10 +21,12 @@ pub use ipc::{
     send_ipc_request, unix_socket_path,
 };
 pub use profile::HardwareProfile;
+pub use sfx::{SFX_FOOTER_MAGIC, SfxBundle, extract_sfx_from_exe, pack_sfx_installer};
 pub use startup::{
-    InstallSummary, ensure_user_profiles_dir, install_user_application, is_autostart_enabled,
-    list_saved_profiles, resolve_sibling_binary, set_autostart_enabled, uninstall_user_application,
-    user_config_dir, user_install_dir,
+    InstallOptions, InstallSummary, ensure_user_profiles_dir, install_user_application,
+    install_with_options, is_autostart_enabled, is_user_application_installed, list_saved_profiles,
+    resolve_sibling_binary, set_autostart_enabled, uninstall_user_application,
+    uninstall_user_application_full, user_config_dir, user_install_dir,
 };
 
 #[cfg(test)]
@@ -66,5 +69,30 @@ mod tests {
     fn procedural_ico_generation_is_valid() {
         let ico = encode_ico_file(&[16, 32, 48], TrayIconStatus::default());
         assert_eq!(&ico[0..6], &[0, 0, 1, 0, 3, 0]); // ICONDIR with 3 images
+    }
+
+    #[test]
+    fn sfx_bundle_roundtrip_verifies_crc_and_stub_len() {
+        let fake_stub = b"MZ_FAKE_PE_STUB_HEADER_BYTES";
+        let file_a = vec![0x55u8; 4096];
+        let file_b = b"hello bkr1x installer".as_slice();
+
+        let packed = pack_sfx_installer(
+            fake_stub,
+            &[("bkr1x-daemon.exe", &file_a), ("readme.txt", file_b)],
+        )
+        .unwrap();
+
+        let tmp = std::env::temp_dir().join("bkr1x_sfx_unit_test.bin");
+        std::fs::write(&tmp, &packed).unwrap();
+        let extracted = extract_sfx_from_exe(&tmp).unwrap().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(extracted.stub_len, fake_stub.len() as u64);
+        assert_eq!(extracted.files.len(), 2);
+        assert_eq!(extracted.files[0].0, "bkr1x-daemon.exe");
+        assert_eq!(extracted.files[0].1, file_a);
+        assert_eq!(extracted.files[1].0, "readme.txt");
+        assert_eq!(extracted.files[1].1, file_b);
     }
 }

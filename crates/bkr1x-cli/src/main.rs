@@ -9,8 +9,9 @@ use std::time::Duration;
 use bkr1x_hal::profile::{format_light_mode, parse_light_mode};
 use bkr1x_hal::{
     Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
-    install_user_application, is_autostart_enabled, is_daemon_running, resolve_sibling_binary,
-    send_ipc_request, set_autostart_enabled, uninstall_user_application,
+    extract_sfx_from_exe, install_user_application, is_autostart_enabled, is_daemon_running,
+    pack_sfx_installer, resolve_sibling_binary, send_ipc_request, set_autostart_enabled,
+    uninstall_user_application,
 };
 use bkr1x_protocol::{
     ChecksumStrategy, DecodedPacket, LodHeight, MacroStep, MouseConfig, PacketCodec, PollingRate,
@@ -130,6 +131,16 @@ enum Commands {
         #[command(subcommand)]
         action: TrayAction,
     },
+
+    /// Bundle `bkr1x-installer`, `bkr1x-daemon`, `bkr1x-gui`, and `bkr1x-cli` into a standalone GitHub Release `.exe` Setup Wizard.
+    PackageInstaller {
+        /// Directory containing compiled release binaries (defaults to the folder of `bkr1x-cli`).
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// Output path for the standalone installer (defaults to `dist/windows/BKR1X-Setup-v<ver>-x64.exe`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -231,6 +242,9 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Uninstall => cmd_uninstall(),
         Commands::Open => cmd_open(),
         Commands::Tray { action } => cmd_tray(action),
+        Commands::PackageInstaller { bin_dir, output } => {
+            cmd_package_installer(bin_dir.as_deref(), output.as_deref())
+        }
     }
 }
 
@@ -832,4 +846,83 @@ fn cmd_tray(action: TrayAction) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn cmd_package_installer(
+    bin_dir_override: Option<&Path>,
+    output_override: Option<&Path>,
+) -> Result<(), String> {
+    let bin_dir = match bin_dir_override {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .ok_or_else(|| "cannot determine current executable directory".to_owned())?,
+    };
+
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let stub_name = format!("bkr1x-installer{ext}");
+    let daemon_name = format!("bkr1x-daemon{ext}");
+    let gui_name = format!("bkr1x-gui{ext}");
+    let cli_name = format!("bkr1x-cli{ext}");
+
+    let read_bin = |fname: &str| -> Result<Vec<u8>, String> {
+        let p = bin_dir.join(fname);
+        std::fs::read(&p).map_err(|e| {
+            format!(
+                "missing compiled binary {} ({e}) — run `cargo build --release --workspace` first",
+                p.display()
+            )
+        })
+    };
+
+    let stub_bytes = read_bin(&stub_name)?;
+    let daemon_bytes = read_bin(&daemon_name)?;
+    let gui_bytes = read_bin(&gui_name)?;
+    let cli_bytes = read_bin(&cli_name)?;
+
+    let raw_total = stub_bytes.len() + daemon_bytes.len() + gui_bytes.len() + cli_bytes.len();
+    let sfx_exe = pack_sfx_installer(
+        &stub_bytes,
+        &[
+            (&daemon_name, &daemon_bytes),
+            (&gui_name, &gui_bytes),
+            (&cli_name, &cli_bytes),
+        ],
+    )?;
+
+    let out_path = match output_override {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from("dist")
+            .join("windows")
+            .join(format!("BKR1X-Setup-v{}-x64{ext}", env!("CARGO_PKG_VERSION"))),
+    };
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&out_path, &sfx_exe)
+        .map_err(|e| format!("failed writing {}: {e}", out_path.display()))?;
+
+    // Self-verify archive CRC16 & decompression before declaring release ready
+    let verified = extract_sfx_from_exe(&out_path)?
+        .ok_or_else(|| "verification failed: missing BKR1XSFX trailer".to_owned())?;
+    if verified.files.len() != 3 {
+        return Err("verification failed: unexpected embedded file count".to_owned());
+    }
+
+    println!("Fire Phoenix BK-R1X — GitHub Release Setup Wizard Packaged");
+    println!("───────────────────────────────────────────────────────────");
+    println!("  Output Installer  : {}", out_path.display());
+    println!(
+        "  Uncompressed Sum  : {:.2} MB (stub + daemon + gui + cli)",
+        raw_total as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  Final Setup Size  : {:.2} MB (zlib level-9 + CRC16 verified)",
+        sfx_exe.len() as f64 / (1024.0 * 1024.0)
+    );
+    println!("  Silent CLI Flag   : --silent (unattended) | --uninstall");
+    Ok(())
 }

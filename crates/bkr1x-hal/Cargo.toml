@@ -7,6 +7,7 @@ description = "Cross-platform HID Hardware Abstraction Layer, profile loader, an
 
 [dependencies]
 bkr1x-protocol.workspace = true
+flate2.workspace = true
 hidapi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
