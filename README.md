@@ -9,15 +9,15 @@ Lightweight native desktop driver and configurator for the **Fire Phoenix BK-R1X
 ## 1. Install via Setup Wizard (Recommended)
 
 ### Windows
-1. Download **`BKR1X-Setup-v0.1.0-x64.exe`** from the [**Releases**](https://github.com/cid0001555/Driver-Mouse-BK-R1X/releases/latest) page.
+1. Download **`BKR1X-Setup-v0.2.0-x64.exe`** from the [**Releases**](https://github.com/cid0001555/Driver-Mouse-BK-R1X/releases/latest) page.
 2. Double-click it and click **Install Fire Phoenix BK-R1X** (no Administrator / UAC prompt needed).
 3. To uninstall later, use **Windows Settings → Apps → Installed apps → Fire Phoenix BK-R1X Driver**.
 
 ### Linux (`x86_64`)
-Download `BKR1X-v0.1.0-linux-x86_64.tar.gz` from [**Releases**](https://github.com/cid0001555/Driver-Mouse-BK-R1X/releases/latest), extract it, and install the non-root `udev` rule:
+Download `BKR1X-v0.2.0-linux-x86_64.tar.gz` from [**Releases**](https://github.com/cid0001555/Driver-Mouse-BK-R1X/releases/latest), extract it, and install the non-root `udev` rule:
 
 ```bash
-tar -xzf BKR1X-v0.1.0-linux-x86_64.tar.gz && cd bkr1x-linux-x86_64
+tar -xzf BKR1X-v0.2.0-linux-x86_64.tar.gz && cd bkr1x-linux-x86_64
 install -Dm755 bkr1x-daemon bkr1x-gui bkr1x-cli -t ~/.local/bin/
 sudo cp dist/linux/99-bkr1x-hidraw.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger

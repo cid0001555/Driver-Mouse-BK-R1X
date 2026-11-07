@@ -1,25 +1,25 @@
 [Unit]
 Description=Fire Phoenix BK-R1X Ultra-Lightweight Telemetry & Profile Daemon
-Documentation=https://github.com/driver-mouse-bkr1x/Driver-Mouse-BK-R1X
+Documentation=https://github.com/cid0001555/Driver-Mouse-BK-R1X
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/bkr1x-daemon --poll-secs 60 --profiles-dir %h/.config/bkr1x/profiles
+ExecStart=%h/.local/bin/bkr1x-daemon --poll-secs 60 --profiles-dir %h/.config/bkr1x/profiles
 Restart=on-failure
 RestartSec=3
 
-# Strict resource ceiling (< 2 MB typical RSS; hard-capped at 8M & 2% CPU)
+# Hard ceiling well above typical < 2 MB RSS & 0.0% idle CPU footprint
 MemoryAccounting=true
 MemoryMax=8M
 CPUAccounting=true
 CPUQuota=2%
 
-# Userspace sandboxing
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths=-%h/.config/bkr1x
 RuntimeDirectory=bkr1x
 
 [Install]

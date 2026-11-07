@@ -30,7 +30,7 @@ jobs:
       - name: Package standalone Setup Wizard (.exe)
         shell: pwsh
         run: |
-          $tag = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "v0.1.0" }
+          $tag = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "v0.2.0" }
           New-Item -ItemType Directory -Force -Path dist/release | Out-Null
           $outExe = "dist/release/BKR1X-Setup-$tag-x64.exe"
           .\target\release\bkr1x-cli.exe package-installer --output $outExe
@@ -64,7 +64,7 @@ jobs:
 
       - name: Package Linux tarball
         run: |
-          TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          TAG="${GITHUB_REF_NAME:-v0.2.0}"
           STAGE="bkr1x-linux-x86_64"
           mkdir -p "$STAGE" dist/release
           cp target/release/bkr1x-daemon target/release/bkr1x-cli target/release/bkr1x-gui README.md "$STAGE/"
