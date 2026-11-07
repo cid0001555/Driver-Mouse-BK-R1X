@@ -15,9 +15,11 @@ use std::thread;
 use std::time::Duration;
 
 use bkr1x_hal::profile::{MacroProfileEntry, format_light_mode};
+#[cfg(windows)]
+use bkr1x_hal::send_ipc_request;
 use bkr1x_hal::{
     Bkr1xDevice, DaemonStatusSnapshot, HardwareProfile, IpcRequest, IpcResponse, IpcWireTrace,
-    TraceDirection, ensure_user_profiles_dir, send_ipc_request,
+    TraceDirection, ensure_user_profiles_dir,
 };
 use bkr1x_protocol::{
     ButtonAction, ButtonMapping, HardwareStateMachine, MacroInput, MacroStep, MouseClickButton,
@@ -55,6 +57,7 @@ pub(crate) enum DaemonCommand {
     Shutdown,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 struct DaemonConfig {
     poll_interval: Duration,
     profiles_dir: PathBuf,

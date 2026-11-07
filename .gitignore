@@ -1,4 +1,5 @@
 /target
 /bundles
 /dist/windows/*.exe
+/dist/windows/*.sha256
 *.pdb
