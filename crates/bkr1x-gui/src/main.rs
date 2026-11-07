@@ -1,33 +1,47 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! `bkr1x-gui` — Reactive, zero-idle-CPU native configurator (`eframe` + `glow` OpenGL)
-//! for the Fire Phoenix BK-R1X tri-mode wireless gaming mouse.
+//! `bkr1x-gui` — On-demand reactive OpenGL (`glow`) configurator for the Fire Phoenix BK-R1X.
+//!
+//! Coordinates seamlessly with the `< 2 MB` `bkr1x-daemon` System Tray agent:
+//! - Opening from the taskbar tray icon loads live telemetry & config in milliseconds over IPC.
+//! - Closing the window (`X`) exits the OpenGL process cleanly to free 100% of GUI RAM while
+//!   leaving the BK-R1X System Tray icon active in the taskbar notification area.
 
 mod keycodes;
 
 use std::collections::VecDeque;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bkr1x_hal::{Bkr1xDevice, DeviceError, TraceDirection, WireTraceEntry};
+use bkr1x_hal::profile::{MacroProfileEntry, MacroStepSpec, parse_light_mode};
+use bkr1x_hal::{
+    Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
+    IpcWireTrace, TraceDirection, TrayIconStatus, WireTraceEntry, ensure_user_profiles_dir,
+    install_user_application, is_autostart_enabled, is_daemon_running, list_saved_profiles,
+    render_mouse_icon_rgba, resolve_sibling_binary, send_ipc_request, set_autostart_enabled,
+};
 use bkr1x_protocol::{
-    BUTTON_SLOT_COUNT, ButtonAction, ButtonMapping, ButtonSlot, ChecksumStrategy,
-    DEFAULT_STAGE_COLORS, HardwareStateMachine, KeyModifiers, LightMode, LodHeight,
-    MACRO_FLASH_TOTAL_LEN, MAX_DPI_STAGES, MacroInput, MacroStep, MacroTrigger, MediaFunction,
-    MouseClickButton, MouseConfig, PAW3311_DPI_MAX, PAW3311_DPI_MIN, PAW3311_DPI_STEP,
-    PacketCodec, PollingRate, REPORT_PAYLOAD_LEN, ScrollDirection, VALID_SLEEP_MINUTES,
-    compile_macro_bank,
+    BUTTON_SLOT_COUNT, BatteryTelemetry, ButtonAction, ButtonMapping, ButtonSlot, ChecksumStrategy,
+    ConnectionMode, DEFAULT_STAGE_COLORS, FirmwareVersion, HardwareStateMachine, KeyModifiers,
+    LightMode, LodHeight, MACRO_FLASH_TOTAL_LEN, MAX_DPI_STAGES, MacroInput, MacroStep,
+    MacroTrigger, MediaFunction, MouseClickButton, MouseConfig, PAW3311_DPI_MAX, PAW3311_DPI_MIN,
+    PAW3311_DPI_STEP, PacketCodec, PollingRate, REPORT_PAYLOAD_LEN, ScrollDirection, SensorFlags,
+    VALID_SLEEP_MINUTES, compile_macro_bank,
 };
 use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::keycodes::{HID_KEY_TABLE, keycode_label};
 
+pub const GUI_WINDOW_TITLE: &str = "Fire Phoenix BK-R1X — Native PAW3311 Configurator";
 const MAX_UI_TRACE_LOG: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
     Performance,
     ButtonsAndMacros,
+    ProfilesAndStartup,
     TelemetryInspector,
 }
 
@@ -38,10 +52,11 @@ struct UiMacroSlot {
 }
 
 enum WorkerCommand {
-    ConnectAndSync,
+    ConnectAndSync { force_refresh: bool },
     FlashConfig(MouseConfig),
     FlashButtons(ButtonMapping),
-    FlashMacros(Vec<Vec<MacroStep>>),
+    FlashMacros(Vec<UiMacroSlot>),
+    ApplySavedProfile(Box<HardwareProfile>),
     Shutdown,
 }
 
@@ -51,6 +66,7 @@ enum WorkerEvent {
         product_name: String,
         vid: u16,
         pid: u16,
+        via_daemon: bool,
         traces: Vec<WireTraceEntry>,
     },
     FlashSuccess {
@@ -62,9 +78,107 @@ enum WorkerEvent {
     },
 }
 
+fn ipc_traces_to_hal(ipc_traces: Option<Vec<IpcWireTrace>>) -> Vec<WireTraceEntry> {
+    let Some(list) = ipc_traces else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .map(|t| {
+            let mut payload = [0u8; REPORT_PAYLOAD_LEN];
+            for (idx, hex_b) in t.payload_hex.split_whitespace().take(64).enumerate() {
+                payload[idx] = u8::from_str_radix(hex_b, 16).unwrap_or(0);
+            }
+            WireTraceEntry {
+                timestamp_unix_ms: t.timestamp_unix_ms,
+                direction: if t.is_out {
+                    TraceDirection::Out
+                } else {
+                    TraceDirection::In
+                },
+                report_id: t.report_id,
+                payload,
+                summary: t.summary,
+            }
+        })
+        .collect()
+}
+
+fn snapshot_to_hw_state(snap: &DaemonStatusSnapshot) -> HardwareStateMachine {
+    let mut dpi_stages = MouseConfig::factory_default().dpi_stages;
+    for (i, &d) in snap.dpi_stages.iter().take(MAX_DPI_STAGES).enumerate() {
+        dpi_stages[i] = d;
+    }
+    let dpi_count = (snap.dpi_stages.len() as u8).clamp(1, MAX_DPI_STAGES as u8);
+    let active_dpi_stage = snap.active_dpi_stage.saturating_sub(1).min(dpi_count - 1);
+
+    let mut fw_parts = snap
+        .firmware_version
+        .split('.')
+        .map(|s| s.parse::<u8>().unwrap_or(0));
+    let fw = FirmwareVersion {
+        major: fw_parts.next().unwrap_or(1),
+        minor: fw_parts.next().unwrap_or(0),
+        patch: fw_parts.next().unwrap_or(0),
+    };
+
+    let connection = if snap.connection_mode.contains("Wired") {
+        Some(ConnectionMode::UsbWired)
+    } else if snap.connected {
+        Some(ConnectionMode::Wireless24Ghz)
+    } else {
+        None
+    };
+
+    let buttons = match snap.button_slots {
+        Some(raw) => ButtonMapping {
+            slots: core::array::from_fn(|i| ButtonAction::from_bytes(raw[i])),
+        },
+        None => ButtonMapping::factory_default(),
+    };
+
+    HardwareStateMachine {
+        connection,
+        online: snap.online,
+        firmware: fw,
+        battery: BatteryTelemetry {
+            percent: snap.battery_percent,
+            charging: snap.charging,
+        },
+        config: MouseConfig {
+            dpi_stages,
+            dpi_count,
+            active_dpi_stage,
+            polling_rate: PollingRate::from_hz(snap.polling_rate_hz).unwrap_or(PollingRate::Hz1000),
+            lod: LodHeight::from_mm(snap.lod_mm).unwrap_or(LodHeight::Mm1),
+            debounce_ms: snap.debounce_ms,
+            sensor_flags: SensorFlags {
+                ripple_control: snap.ripple_control,
+                angle_snapping: snap.angle_snapping,
+                motion_sync: snap.motion_sync,
+                reserved_bits: SensorFlags::BIT_FACTORY_BASE,
+            },
+            sleep_minutes: snap.sleep_minutes,
+            light_mode: parse_light_mode(&snap.light_mode).unwrap_or(LightMode::Off),
+            scroll_direction: if snap.reverse_scroll {
+                ScrollDirection::Reverse
+            } else {
+                ScrollDirection::Normal
+            },
+            highspeed_mode: snap.highspeed_mode,
+            wakeup_on_move: snap.wakeup_on_move,
+            move_lights_off: snap.move_lights_off,
+        },
+        buttons,
+    }
+}
+
 fn spawn_hardware_worker(
     egui_ctx: egui::Context,
-) -> (Sender<WorkerCommand>, Receiver<WorkerEvent>, JoinHandle<()>) {
+) -> (
+    Sender<WorkerCommand>,
+    Receiver<WorkerEvent>,
+    JoinHandle<()>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
     let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
 
@@ -72,12 +186,44 @@ fn spawn_hardware_worker(
         .name("bkr1x-gui-hid".to_owned())
         .stack_size(128 * 1024)
         .spawn(move || {
-            let mut dev_opt: Option<Bkr1xDevice> = None;
+            let mut direct_dev: Option<Bkr1xDevice> = None;
 
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
                     WorkerCommand::Shutdown => break,
-                    WorkerCommand::ConnectAndSync => {
+                    WorkerCommand::ConnectAndSync { force_refresh } => {
+                        let ipc_req = if force_refresh {
+                            IpcRequest::Refresh
+                        } else {
+                            IpcRequest::GetFullState
+                        };
+                        if let Ok(IpcResponse::Ok {
+                            snapshot: Some(snap),
+                            traces,
+                            ..
+                        }) = send_ipc_request(&ipc_req)
+                        {
+                            direct_dev = None; // Release any direct handle when daemon owns HID
+                            if snap.connected {
+                                let state = Box::new(snapshot_to_hw_state(&snap));
+                                let _ = evt_tx.send(WorkerEvent::Connected {
+                                    state,
+                                    product_name: if snap.product_name.is_empty() {
+                                        "BK-R1X".to_owned()
+                                    } else {
+                                        snap.product_name
+                                    },
+                                    vid: snap.vendor_id,
+                                    pid: snap.product_id,
+                                    via_daemon: true,
+                                    traces: ipc_traces_to_hal(traces),
+                                });
+                                egui_ctx.request_repaint();
+                                continue;
+                            }
+                        }
+
+                        // Fallback to direct HID if daemon isn't running
                         match Bkr1xDevice::open_auto() {
                             Ok(mut dev) => {
                                 let _ = dev.sync_all();
@@ -85,41 +231,74 @@ fn spawn_hardware_worker(
                                 let state = Box::new(*dev.state());
                                 let traces: Vec<_> = dev.trace_log().iter().cloned().collect();
                                 dev.clear_trace_log();
-                                dev_opt = Some(dev);
+                                direct_dev = Some(dev);
                                 let _ = evt_tx.send(WorkerEvent::Connected {
                                     state,
                                     product_name: info.product_name,
                                     vid: info.vendor_id,
                                     pid: info.product_id,
+                                    via_daemon: false,
                                     traces,
                                 });
                             }
                             Err(error) => {
-                                dev_opt = None;
+                                direct_dev = None;
                                 let _ = evt_tx.send(WorkerEvent::ConnectionFailed { error });
                             }
                         }
-                        // Wake the sleeping reactive GUI event loop!
                         egui_ctx.request_repaint();
                     }
                     WorkerCommand::FlashConfig(cfg) => {
-                        if dev_opt.is_none() {
-                            dev_opt = Bkr1xDevice::open_auto().ok();
+                        let prof = HardwareProfile::from_hardware(
+                            "Active Config",
+                            &cfg,
+                            &ButtonMapping::factory_default(),
+                        );
+                        let mut prof_no_btns = prof;
+                        prof_no_btns.buttons = None;
+
+                        if let Ok(resp) = send_ipc_request(&IpcRequest::ApplyProfile {
+                            profile: Box::new(prof_no_btns),
+                        }) {
+                            match resp {
+                                IpcResponse::Ok { traces, .. } => {
+                                    let _ = evt_tx.send(WorkerEvent::FlashSuccess {
+                                        message: format!(
+                                            "Flashed PAW3311 via Tray Agent: {} DPI @ {} Hz (LOD {}mm, Debounce {}ms)",
+                                            cfg.active_dpi(),
+                                            cfg.polling_rate.as_hz(),
+                                            cfg.lod.as_mm(),
+                                            cfg.debounce_ms
+                                        ),
+                                        traces: ipc_traces_to_hal(traces),
+                                    });
+                                }
+                                IpcResponse::Error { message } => {
+                                    let _ = evt_tx.send(WorkerEvent::ConnectionFailed {
+                                        error: DeviceError::Ipc(message),
+                                    });
+                                }
+                            }
+                            egui_ctx.request_repaint();
+                            continue;
                         }
-                        match dev_opt.as_mut() {
-                            Some(dev) => match dev.write_config(&cfg).and_then(|()| {
-                                dev.write_light_mode(cfg.light_mode)
-                            }) {
+
+                        if direct_dev.is_none() {
+                            direct_dev = Bkr1xDevice::open_auto().ok();
+                        }
+                        match direct_dev.as_mut() {
+                            Some(dev) => match dev
+                                .write_config(&cfg)
+                                .and_then(|()| dev.write_light_mode(cfg.light_mode))
+                            {
                                 Ok(()) => {
                                     let traces: Vec<_> = dev.trace_log().iter().cloned().collect();
                                     dev.clear_trace_log();
                                     let _ = evt_tx.send(WorkerEvent::FlashSuccess {
                                         message: format!(
-                                            "Flashed PAW3311: {} DPI @ {} Hz (LOD {}mm, Debounce {}ms)",
+                                            "Flashed PAW3311: {} DPI @ {} Hz",
                                             cfg.active_dpi(),
-                                            cfg.polling_rate.as_hz(),
-                                            cfg.lod.as_mm(),
-                                            cfg.debounce_ms
+                                            cfg.polling_rate.as_hz()
                                         ),
                                         traces,
                                     });
@@ -137,17 +316,41 @@ fn spawn_hardware_worker(
                         egui_ctx.request_repaint();
                     }
                     WorkerCommand::FlashButtons(buttons) => {
-                        if dev_opt.is_none() {
-                            dev_opt = Bkr1xDevice::open_auto().ok();
+                        let raw_slots: [[u8; 4]; 8] =
+                            core::array::from_fn(|i| buttons.slots[i].to_bytes());
+                        if let Ok(resp) = send_ipc_request(&IpcRequest::FlashButtons { raw_slots })
+                        {
+                            match resp {
+                                IpcResponse::Ok {
+                                    traces, message, ..
+                                } => {
+                                    let _ = evt_tx.send(WorkerEvent::FlashSuccess {
+                                        message: message.unwrap_or_else(|| {
+                                            "Flashed button map via Tray Agent.".to_owned()
+                                        }),
+                                        traces: ipc_traces_to_hal(traces),
+                                    });
+                                }
+                                IpcResponse::Error { message } => {
+                                    let _ = evt_tx.send(WorkerEvent::ConnectionFailed {
+                                        error: DeviceError::Ipc(message),
+                                    });
+                                }
+                            }
+                            egui_ctx.request_repaint();
+                            continue;
                         }
-                        match dev_opt.as_mut() {
+
+                        if direct_dev.is_none() {
+                            direct_dev = Bkr1xDevice::open_auto().ok();
+                        }
+                        match direct_dev.as_mut() {
                             Some(dev) => match dev.write_buttons(&buttons) {
                                 Ok(()) => {
                                     let traces: Vec<_> = dev.trace_log().iter().cloned().collect();
                                     dev.clear_trace_log();
                                     let _ = evt_tx.send(WorkerEvent::FlashSuccess {
-                                        message: "Flashed 8-slot button mapping table to MCU."
-                                            .to_owned(),
+                                        message: "Flashed 8-slot button map to MCU.".to_owned(),
                                         traces,
                                     });
                                 }
@@ -163,14 +366,65 @@ fn spawn_hardware_worker(
                         }
                         egui_ctx.request_repaint();
                     }
-                    WorkerCommand::FlashMacros(macros) => {
-                        if dev_opt.is_none() {
-                            dev_opt = Bkr1xDevice::open_auto().ok();
+                    WorkerCommand::FlashMacros(ui_macros) => {
+                        let entries: Vec<MacroProfileEntry> = ui_macros
+                            .iter()
+                            .map(|m| MacroProfileEntry {
+                                name: m.name.clone(),
+                                steps: m
+                                    .steps
+                                    .iter()
+                                    .map(|s| {
+                                        let (kind, code) = match s.input {
+                                            MacroInput::MouseButton(b) => {
+                                                ("mouse".to_owned(), b as u8)
+                                            }
+                                            MacroInput::KeyboardKey(kc) => ("key".to_owned(), kc),
+                                        };
+                                        MacroStepSpec {
+                                            kind,
+                                            code,
+                                            pressed: s.pressed,
+                                            delay_ms: s.delay_ms,
+                                        }
+                                    })
+                                    .collect(),
+                            })
+                            .collect();
+
+                        if let Ok(resp) =
+                            send_ipc_request(&IpcRequest::FlashMacros { macros: entries })
+                        {
+                            match resp {
+                                IpcResponse::Ok {
+                                    traces, message, ..
+                                } => {
+                                    let _ = evt_tx.send(WorkerEvent::FlashSuccess {
+                                        message: message.unwrap_or_else(|| {
+                                            "Flashed macro bank via Tray Agent.".to_owned()
+                                        }),
+                                        traces: ipc_traces_to_hal(traces),
+                                    });
+                                }
+                                IpcResponse::Error { message } => {
+                                    let _ = evt_tx.send(WorkerEvent::ConnectionFailed {
+                                        error: DeviceError::Ipc(message),
+                                    });
+                                }
+                            }
+                            egui_ctx.request_repaint();
+                            continue;
                         }
-                        match dev_opt.as_mut() {
+
+                        if direct_dev.is_none() {
+                            direct_dev = Bkr1xDevice::open_auto().ok();
+                        }
+                        match direct_dev.as_mut() {
                             Some(dev) => {
+                                let vecs: Vec<Vec<MacroStep>> =
+                                    ui_macros.into_iter().map(|m| m.steps).collect();
                                 let slices: Vec<&[MacroStep]> =
-                                    macros.iter().map(Vec::as_slice).collect();
+                                    vecs.iter().map(Vec::as_slice).collect();
                                 match dev.write_macros(&slices) {
                                     Ok(bytes) => {
                                         let traces: Vec<_> =
@@ -197,6 +451,30 @@ fn spawn_hardware_worker(
                         }
                         egui_ctx.request_repaint();
                     }
+                    WorkerCommand::ApplySavedProfile(prof) => {
+                        if let Ok(resp) = send_ipc_request(&IpcRequest::ApplyProfile {
+                            profile: prof.clone(),
+                        }) {
+                            match resp {
+                                IpcResponse::Ok {
+                                    traces, message, ..
+                                } => {
+                                    let _ = evt_tx.send(WorkerEvent::FlashSuccess {
+                                        message: message.unwrap_or_else(|| {
+                                            format!("Applied profile '{}'", prof.name)
+                                        }),
+                                        traces: ipc_traces_to_hal(traces),
+                                    });
+                                }
+                                IpcResponse::Error { message } => {
+                                    let _ = evt_tx.send(WorkerEvent::ConnectionFailed {
+                                        error: DeviceError::Ipc(message),
+                                    });
+                                }
+                            }
+                            egui_ctx.request_repaint();
+                        }
+                    }
                 }
             }
         })
@@ -205,17 +483,41 @@ fn spawn_hardware_worker(
     (cmd_tx, evt_rx, handle)
 }
 
+/// Ensures `bkr1x-daemon` is running in the system tray so closing the GUI keeps the tray icon active.
+fn ensure_tray_daemon_spawned() -> bool {
+    if is_daemon_running() {
+        return true;
+    }
+    let Some(daemon_exe) = resolve_sibling_binary("bkr1x-daemon") else {
+        return false;
+    };
+    let mut cmd = std::process::Command::new(&daemon_exe);
+    cmd.arg("--silent");
+    if let Some(p) = daemon_exe.parent() {
+        cmd.current_dir(p);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn().is_ok()
+}
+
 struct Bkr1xGuiApp {
     tab: ActiveTab,
     hw_state: HardwareStateMachine,
     connected_device_label: Option<String>,
+    connected_via_daemon: bool,
+    tray_agent_running: bool,
+    autostart_enabled: bool,
     last_error: Option<DeviceError>,
     status_banner: String,
 
-    // Editable performance & stage colors
     stage_colors: [[u8; 3]; MAX_DPI_STAGES],
 
-    // Editable button & macro builder state
+    // Button & macro builder state
     selected_slot: usize,
     edit_sc_ctrl: bool,
     edit_sc_shift: bool,
@@ -224,7 +526,7 @@ struct Bkr1xGuiApp {
     edit_sc_keycode: u8,
     edit_macro_slot: u8,
     edit_macro_repeat: u8,
-    edit_macro_mode: u8, // 0=Fixed, 2=Hold, 3=Toggle
+    edit_macro_mode: u8,
 
     macros: Vec<UiMacroSlot>,
     selected_macro_idx: usize,
@@ -232,6 +534,11 @@ struct Bkr1xGuiApp {
     new_step_keycode: u8,
     new_step_mouse_btn: MouseClickButton,
     new_step_delay_ms: u16,
+
+    // Profiles & Startup manager state
+    saved_profiles: Vec<(PathBuf, HardwareProfile)>,
+    new_profile_name: String,
+    new_profile_process: String,
 
     // Raw HID Debugger state
     show_raw_debugger_drawer: bool,
@@ -247,8 +554,14 @@ struct Bkr1xGuiApp {
 impl Bkr1xGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_dark_technical_theme(&cc.egui_ctx);
+        let tray_started = ensure_tray_daemon_spawned();
+        let saved_profiles = list_saved_profiles();
+        let autostart_enabled = is_autostart_enabled();
+
         let (worker_tx, worker_rx, join) = spawn_hardware_worker(cc.egui_ctx.clone());
-        let _ = worker_tx.send(WorkerCommand::ConnectAndSync);
+        let _ = worker_tx.send(WorkerCommand::ConnectAndSync {
+            force_refresh: false,
+        });
 
         let default_macro = UiMacroSlot {
             name: "Double Tap A".to_owned(),
@@ -270,15 +583,18 @@ impl Bkr1xGuiApp {
             tab: ActiveTab::Performance,
             hw_state: HardwareStateMachine::new(),
             connected_device_label: None,
+            connected_via_daemon: false,
+            tray_agent_running: tray_started,
+            autostart_enabled,
             last_error: None,
-            status_banner: "Probing USB-C (0xA8A4:0x2255) & 2.4GHz (0xA8A5:0x2255)...".to_owned(),
+            status_banner: "Synchronizing with BK-R1X hardware...".to_owned(),
             stage_colors: DEFAULT_STAGE_COLORS,
             selected_slot: 0,
             edit_sc_ctrl: true,
             edit_sc_shift: false,
             edit_sc_alt: false,
             edit_sc_win: false,
-            edit_sc_keycode: 0x06, // 'C'
+            edit_sc_keycode: 0x06,
             edit_macro_slot: 0,
             edit_macro_repeat: 1,
             edit_macro_mode: 2,
@@ -288,6 +604,9 @@ impl Bkr1xGuiApp {
             new_step_keycode: 0x04,
             new_step_mouse_btn: MouseClickButton::Left,
             new_step_delay_ms: 15,
+            saved_profiles,
+            new_profile_name: "My Custom Profile".to_owned(),
+            new_profile_process: String::new(),
             show_raw_debugger_drawer: false,
             trace_entries: VecDeque::with_capacity(MAX_UI_TRACE_LOG),
             custom_hex_input:
@@ -308,18 +627,22 @@ impl Bkr1xGuiApp {
                     product_name,
                     vid,
                     pid,
+                    via_daemon,
                     traces,
                 } => {
                     self.hw_state = *state;
+                    self.connected_via_daemon = via_daemon;
+                    self.tray_agent_running = via_daemon || is_daemon_running();
                     self.connected_device_label =
                         Some(format!("{product_name} (0x{vid:04X}:0x{pid:04X})"));
                     self.last_error = None;
                     self.status_banner = format!(
-                        "Connected via {} — Firmware v{}",
+                        "Connected via {} {} — Firmware v{} · Closing window keeps BK-R1X active in System Tray",
                         self.hw_state
                             .connection
                             .map(|m| m.as_str())
                             .unwrap_or("USB"),
+                        if via_daemon { "(Tray Agent)" } else { "(Direct HID)" },
                         self.hw_state.firmware
                     );
                     self.append_traces(traces);
@@ -352,7 +675,12 @@ impl Bkr1xGuiApp {
         }
     }
 
-    fn record_preview_packet(&mut self, report_id: u8, payload: [u8; REPORT_PAYLOAD_LEN], note: &str) {
+    fn record_preview_packet(
+        &mut self,
+        report_id: u8,
+        payload: [u8; REPORT_PAYLOAD_LEN],
+        note: &str,
+    ) {
         if self.trace_entries.len() >= MAX_UI_TRACE_LOG {
             self.trace_entries.pop_front();
         }
@@ -418,8 +746,7 @@ impl Bkr1xGuiApp {
         match compile_macro_bank(&slices, &mut flash) {
             Ok(used) => {
                 let codec = PacketCodec::new(ChecksumStrategy::None);
-                let first_chunk =
-                    codec.encode_write_macro_chunk(0, &flash[..used.min(56)]);
+                let first_chunk = codec.encode_write_macro_chunk(0, &flash[..used.min(56)]);
                 if self.connected_device_label.is_none() {
                     self.record_preview_packet(
                         first_chunk.report_id,
@@ -427,7 +754,9 @@ impl Bkr1xGuiApp {
                         &format!("PREVIEW TxWriteMacroChunk ({used}B total)"),
                     );
                 }
-                let _ = self.worker_tx.send(WorkerCommand::FlashMacros(raw_vecs));
+                let _ = self
+                    .worker_tx
+                    .send(WorkerCommand::FlashMacros(self.macros.clone()));
             }
             Err(e) => {
                 self.status_banner = format!("Macro compilation failed: {e}");
@@ -439,22 +768,18 @@ impl Bkr1xGuiApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("FIRE PHOENIX BK-R1X")
-                    .font(FontId::proportional(18.0))
+                    .font(FontId::proportional(17.5))
                     .strong()
                     .color(Color32::from_rgb(122, 162, 247)),
-            );
-            ui.label(
-                RichText::new("PAW3311 Native Driver")
-                    .size(12.5)
-                    .color(Color32::from_rgb(140, 148, 175)),
             );
 
             ui.separator();
 
             for (tab, label) in [
-                (ActiveTab::Performance, "⚡ Performance (PAW3311)"),
+                (ActiveTab::Performance, "⚡ Performance"),
                 (ActiveTab::ButtonsAndMacros, "🖱 Buttons & Macros"),
-                (ActiveTab::TelemetryInspector, "🔬 Telemetry & HID Inspector"),
+                (ActiveTab::ProfilesAndStartup, "🗂 Profiles & Startup"),
+                (ActiveTab::TelemetryInspector, "🔬 HID Inspector"),
             ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() {
                     self.tab = tab;
@@ -462,13 +787,14 @@ impl Bkr1xGuiApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("↻ Rescan HID").clicked() {
-                    let _ = self.worker_tx.send(WorkerCommand::ConnectAndSync);
+                if ui.button("↻ Sync").clicked() {
+                    let _ = self.worker_tx.send(WorkerCommand::ConnectAndSync {
+                        force_refresh: true,
+                    });
                 }
 
-                ui.toggle_value(&mut self.show_raw_debugger_drawer, "⌨ Raw HID Drawer");
+                ui.toggle_value(&mut self.show_raw_debugger_drawer, "⌨ Raw HID");
 
-                // Battery badge
                 let pct = self.hw_state.battery.percent;
                 let bat_color = if self.connected_device_label.is_none() {
                     Color32::from_rgb(120, 125, 140)
@@ -492,7 +818,6 @@ impl Bkr1xGuiApp {
                 };
                 ui.label(RichText::new(bat_txt).strong().color(bat_color));
 
-                // Connection mode badge
                 let (mode_txt, mode_col) = if let Some(conn) = self.hw_state.connection
                     && self.connected_device_label.is_some()
                 {
@@ -533,13 +858,16 @@ impl Bkr1xGuiApp {
     fn draw_performance_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.columns(2, |cols| {
-                // LEFT COLUMN: 6-Stage PAW3311 DPI Matrix
                 cols[0].group(|ui| {
                     ui.horizontal(|ui| {
                         ui.heading("PixArt PAW3311 — DPI Stages");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let mut count = self.hw_state.config.dpi_count;
-                            ui.add(egui::DragValue::new(&mut count).range(1..=6).prefix("Stages: "));
+                            ui.add(
+                                egui::DragValue::new(&mut count)
+                                    .range(1..=6)
+                                    .prefix("Stages: "),
+                            );
                             if count != self.hw_state.config.dpi_count {
                                 self.hw_state.config.dpi_count = count;
                                 if self.hw_state.config.active_dpi_stage >= count {
@@ -570,10 +898,7 @@ impl Bkr1xGuiApp {
                             .corner_radius(CornerRadius::same(5))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    if ui
-                                        .radio(is_active, format!("Stage {}", idx + 1))
-                                        .clicked()
-                                    {
+                                    if ui.radio(is_active, format!("Stage {}", idx + 1)).clicked() {
                                         self.hw_state.config.active_dpi_stage = idx as u8;
                                     }
 
@@ -591,8 +916,7 @@ impl Bkr1xGuiApp {
                                         )
                                         .changed()
                                     {
-                                        let snapped =
-                                            (val / PAW3311_DPI_STEP) * PAW3311_DPI_STEP;
+                                        let snapped = (val / PAW3311_DPI_STEP) * PAW3311_DPI_STEP;
                                         self.hw_state.config.dpi_stages[idx] =
                                             snapped.clamp(PAW3311_DPI_MIN, PAW3311_DPI_MAX);
                                     }
@@ -602,7 +926,6 @@ impl Bkr1xGuiApp {
                     }
                 });
 
-                // RIGHT COLUMN: Polling Rate, LOD, Debounce, Linearity & Power
                 cols[1].group(|ui| {
                     ui.heading("Polling Rate & Sensor Registers");
                     ui.add_space(6.0);
@@ -715,7 +1038,7 @@ impl Bkr1xGuiApp {
                     ui.horizontal(|ui| {
                         if ui
                             .button(
-                                RichText::new("⚡ Flash Performance to BK-R1X")
+                                RichText::new("⚡ Apply & Save to Mouse")
                                     .strong()
                                     .color(Color32::from_rgb(158, 206, 106)),
                             )
@@ -723,7 +1046,7 @@ impl Bkr1xGuiApp {
                         {
                             self.trigger_flash_config();
                         }
-                        if ui.button("Reset Defaults").clicked() {
+                        if ui.button("Factory Defaults").clicked() {
                             self.hw_state.config = MouseConfig::factory_default();
                         }
                     });
@@ -735,7 +1058,6 @@ impl Bkr1xGuiApp {
     fn draw_buttons_and_macros_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.columns(2, |cols| {
-                // LEFT COLUMN: 7-Button + Wheel Visual Diagram & Action Remapper
                 cols[0].group(|ui| {
                     ui.heading("7-Button & Wheel Remapper");
                     ui.add_space(4.0);
@@ -770,9 +1092,15 @@ impl Bkr1xGuiApp {
                         for (label, act) in [
                             ("Left Click", ButtonAction::MouseClick(MouseClickButton::Left)),
                             ("Right Click", ButtonAction::MouseClick(MouseClickButton::Right)),
-                            ("Middle Click", ButtonAction::MouseClick(MouseClickButton::Middle)),
+                            (
+                                "Middle Click",
+                                ButtonAction::MouseClick(MouseClickButton::Middle),
+                            ),
                             ("Side Back", ButtonAction::MouseClick(MouseClickButton::Back)),
-                            ("Side Forward", ButtonAction::MouseClick(MouseClickButton::Forward)),
+                            (
+                                "Side Forward",
+                                ButtonAction::MouseClick(MouseClickButton::Forward),
+                            ),
                             ("DPI Loop", ButtonAction::DpiLoop),
                             ("Scroll Up", ButtonAction::ScrollUp),
                             ("Scroll Down", ButtonAction::ScrollDown),
@@ -904,7 +1232,6 @@ impl Bkr1xGuiApp {
                     });
                 });
 
-                // RIGHT COLUMN: Hardware Macro Sequence Builder
                 cols[1].group(|ui| {
                     ui.horizontal(|ui| {
                         ui.heading("Hardware Macro Sequence Builder");
@@ -973,8 +1300,12 @@ impl Bkr1xGuiApp {
                                                 format!("Mouse [{}]", b.label())
                                             }
                                         };
-                                        let dir_lbl = if step.pressed { "↓ DOWN" } else { "↑ UP  " };
-                                        ui.monospace(format!("{:>2}. {dir_lbl} {kind_lbl:<18}", idx + 1));
+                                        let dir_lbl =
+                                            if step.pressed { "↓ DOWN" } else { "↑ UP  " };
+                                        ui.monospace(format!(
+                                            "{:>2}. {dir_lbl} {kind_lbl:<18}",
+                                            idx + 1
+                                        ));
                                         ui.add(
                                             egui::DragValue::new(&mut step.delay_ms)
                                                 .range(0..=10_000)
@@ -1064,16 +1395,249 @@ impl Bkr1xGuiApp {
         });
     }
 
+    fn draw_profiles_and_startup_panel(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |cols| {
+            // LEFT COLUMN: Saved Profiles + G HUB Per-Game Auto-Switching
+            cols[0].group(|ui| {
+                ui.heading("Hardware Profiles & Game Auto-Switch");
+                ui.label(
+                    RichText::new(
+                        "Save profiles to switch from the System Tray menu or automatically when a game launches.",
+                    )
+                    .size(12.0)
+                    .color(Color32::from_rgb(150, 160, 190)),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Profile Name:");
+                    ui.text_edit_singleline(&mut self.new_profile_name);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Auto-Switch Process (optional, e.g. cs2.exe):");
+                    ui.text_edit_singleline(&mut self.new_profile_process);
+                });
+
+                if ui
+                    .button(
+                        RichText::new("💾 Save Current Settings as Profile")
+                            .strong()
+                            .color(Color32::from_rgb(125, 207, 255)),
+                    )
+                    .clicked()
+                {
+                    let mut prof = HardwareProfile::from_hardware(
+                        self.new_profile_name.trim(),
+                        &self.hw_state.config,
+                        &self.hw_state.buttons,
+                    );
+                    let proc_trimmed = self.new_profile_process.trim();
+                    if !proc_trimmed.is_empty() {
+                        prof.match_process = Some(proc_trimmed.to_owned());
+                    }
+                    let slug: String = prof
+                        .name
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() {
+                                c.to_ascii_lowercase()
+                            } else {
+                                '-'
+                            }
+                        })
+                        .collect();
+                    let dest = ensure_user_profiles_dir().join(format!("{slug}.toml"));
+                    match prof.save_to_file(&dest) {
+                        Ok(()) => {
+                            let _ = send_ipc_request(&IpcRequest::ReloadProfiles);
+                            self.saved_profiles = list_saved_profiles();
+                            self.status_banner =
+                                format!("Saved profile '{}' -> {}", prof.name, dest.display());
+                        }
+                        Err(e) => {
+                            self.status_banner = format!("Failed saving profile: {e}");
+                        }
+                    }
+                }
+
+                ui.separator();
+                ui.label(RichText::new("Saved Profiles:").strong());
+
+                let mut apply_prof: Option<HardwareProfile> = None;
+                let mut delete_path: Option<PathBuf> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("saved_profiles_scroll")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for (path, prof) in &self.saved_profiles {
+                            egui::Frame::NONE
+                                .fill(Color32::from_rgb(26, 29, 41))
+                                .inner_margin(8.0)
+                                .corner_radius(CornerRadius::same(4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(&prof.name).strong());
+                                            let sub = format!(
+                                                "{} Hz · LOD {}mm · Stages {:?}{}",
+                                                prof.sensor.polling_rate_hz,
+                                                prof.sensor.lod_mm,
+                                                prof.sensor.dpi_stages,
+                                                prof.match_process
+                                                    .as_deref()
+                                                    .map(|p| format!(" · Game: {p}"))
+                                                    .unwrap_or_default()
+                                            );
+                                            ui.label(
+                                                RichText::new(sub)
+                                                    .size(11.5)
+                                                    .color(Color32::from_rgb(145, 155, 185)),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.small_button("🗑").clicked() {
+                                                    delete_path = Some(path.clone());
+                                                }
+                                                if ui.button("Apply").clicked() {
+                                                    apply_prof = Some(prof.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+                    });
+
+                if let Some(prof) = apply_prof {
+                    if let Ok(cfg) = prof.to_mouse_config() {
+                        self.hw_state.config = cfg;
+                    }
+                    if let Ok(btns) = prof.to_button_mapping() {
+                        self.hw_state.buttons = btns;
+                    }
+                    self.new_profile_name = prof.name.clone();
+                    self.new_profile_process = prof.match_process.clone().unwrap_or_default();
+                    let _ = self
+                        .worker_tx
+                        .send(WorkerCommand::ApplySavedProfile(Box::new(prof)));
+                }
+
+                if let Some(del_p) = delete_path {
+                    let _ = fs::remove_file(&del_p);
+                    let _ = send_ipc_request(&IpcRequest::ReloadProfiles);
+                    self.saved_profiles = list_saved_profiles();
+                }
+            });
+
+            // RIGHT COLUMN: Windows Startup, System Tray & Desktop Installation
+            cols[1].group(|ui| {
+                ui.heading("Windows Startup & System Tray");
+                ui.add_space(6.0);
+
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(24, 34, 30))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(158, 206, 106)))
+                    .inner_margin(10.0)
+                    .corner_radius(CornerRadius::same(5))
+                    .show(ui, |ui| {
+                        let tray_txt = if self.tray_agent_running {
+                            "● System Tray Agent is ACTIVE in your taskbar notification area (< 2 MB RAM, 0% idle CPU)"
+                        } else {
+                            "○ System Tray Agent is currently stopped"
+                        };
+                        ui.label(
+                            RichText::new(tray_txt)
+                                .strong()
+                                .color(Color32::from_rgb(158, 206, 106)),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            "• Left-click the BK-R1X tray icon anytime to open this configurator.\n\
+                             • Right-click the tray icon to switch DPI, Polling Rate, or Profiles in 1 click.\n\
+                             • Closing this window (X) frees 100% of GUI memory while keeping the tray icon running.",
+                        );
+                    });
+
+                ui.add_space(12.0);
+                let mut auto = self.autostart_enabled;
+                if ui
+                    .checkbox(
+                        &mut auto,
+                        "Launch BK-R1X automatically when I turn on my computer (Windows Login)",
+                    )
+                    .changed()
+                {
+                    match set_autostart_enabled(auto, None) {
+                        Ok(()) => {
+                            self.autostart_enabled = auto;
+                            self.status_banner = if auto {
+                                "Enabled automatic launch at Windows login.".to_owned()
+                            } else {
+                                "Disabled automatic launch at Windows login.".to_owned()
+                            };
+                        }
+                        Err(e) => {
+                            self.status_banner = format!("Startup toggle error: {e}");
+                        }
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if !self.tray_agent_running && ui.button("▶ Start System Tray Agent").clicked() {
+                        self.tray_agent_running = ensure_tray_daemon_spawned();
+                    }
+
+                    if ui
+                        .button("📦 Install / Update Start Menu App")
+                        .on_hover_text(
+                            "Copies binaries to %LOCALAPPDATA%\\Programs\\BKR1X, creates Start Menu shortcut, and registers Windows Startup",
+                        )
+                        .clicked()
+                    {
+                        match install_user_application(true) {
+                            Ok(summary) => {
+                                self.autostart_enabled = summary.autostart_registered;
+                                self.tray_agent_running = ensure_tray_daemon_spawned();
+                                self.status_banner = format!(
+                                    "Installed to {} & created Start Menu shortcut!",
+                                    summary.install_dir.display()
+                                );
+                            }
+                            Err(e) => {
+                                self.status_banner = format!("Install error: {e}");
+                            }
+                        }
+                    }
+
+                    if self.tray_agent_running
+                        && ui
+                            .button(
+                                RichText::new("⏹ Quit Tray Agent & Exit")
+                                    .color(Color32::from_rgb(247, 118, 142)),
+                            )
+                            .clicked()
+                    {
+                        let _ = send_ipc_request(&IpcRequest::Shutdown);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+        });
+    }
+
     fn draw_mouse_diagram(&mut self, ui: &mut egui::Ui) {
         let desired = Vec2::new(ui.available_width().min(360.0), 145.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter_at(rect);
 
-        // Background card
         painter.rect_filled(rect, 6.0, Color32::from_rgb(18, 20, 28));
         let c = rect.center();
 
-        // Stylized top-down BK-R1X mouse silhouette
         let body = Rect::from_center_size(c, Vec2::new(92.0, 128.0));
         painter.rect(
             body,
@@ -1165,6 +1729,14 @@ impl Bkr1xGuiApp {
                     .unwrap_or("No Vendor 0xFF01 Device Opened (Preview Mode)");
                 ui.label(format!("HID Endpoint : {dev_str}"));
                 ui.label(format!(
+                    "Transport    : {}",
+                    if self.connected_via_daemon {
+                        "Shared IPC via System Tray Agent (Zero HID Contention)"
+                    } else {
+                        "Direct HIDraw / hid.dll"
+                    }
+                ));
+                ui.label(format!(
                     "Topology     : {}",
                     self.hw_state
                         .connection
@@ -1235,7 +1807,7 @@ impl Bkr1xGuiApp {
                     if self.trace_entries.is_empty() {
                         ui.label(
                             RichText::new(
-                                "No HID frames captured yet. Click any Flash button or Rescan HID to inspect exact wire bytes.",
+                                "No HID frames captured yet. Click Apply or Sync to inspect exact wire bytes.",
                             )
                             .italics(),
                         );
@@ -1275,8 +1847,6 @@ impl Bkr1xGuiApp {
 
 impl eframe::App for Bkr1xGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Reactive rendering: Drain queued hardware worker events; NEVER call request_repaint()
-        // unconditionally, ensuring 0.0% idle CPU when the window is untouched!
         self.process_worker_events();
 
         egui::TopBottomPanel::top("bkr1x_top_bar")
@@ -1300,7 +1870,7 @@ impl eframe::App for Bkr1xGuiApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Reactive OpenGL (glow) · 0% Idle CPU")
+                            RichText::new("Tray Background < 2 MB · Reactive OpenGL 0% Idle CPU")
                                 .size(11.0)
                                 .color(Color32::from_rgb(100, 108, 135)),
                         );
@@ -1317,12 +1887,12 @@ impl eframe::App for Bkr1xGuiApp {
             .show(ctx, |ui| match self.tab {
                 ActiveTab::Performance => self.draw_performance_panel(ui),
                 ActiveTab::ButtonsAndMacros => self.draw_buttons_and_macros_panel(ui),
+                ActiveTab::ProfilesAndStartup => self.draw_profiles_and_startup_panel(ui),
                 ActiveTab::TelemetryInspector => self.draw_telemetry_and_inspector_panel(ui),
             });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Cleanly terminate worker thread & release HID handle so 100% of resources are freed
         let _ = self.worker_tx.send(WorkerCommand::Shutdown);
         if let Some(handle) = self.worker_join.take() {
             let _ = handle.join();
@@ -1399,14 +1969,48 @@ fn verify_hex_string(raw: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+fn focus_existing_gui_if_open() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+
+    let wide: Vec<u16> = GUI_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if !hwnd.is_null() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+            return true;
+        }
+    }
+    false
+}
+
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    if focus_existing_gui_if_open() {
+        return Ok(());
+    }
+
+    let icon_rgba = render_mouse_icon_rgba(64, TrayIconStatus::default());
+    let app_icon = egui::IconData {
+        rgba: icon_rgba,
+        width: 64,
+        height: 64,
+    };
+
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         vsync: true,
         viewport: egui::ViewportBuilder::default()
-            .with_title("Fire Phoenix BK-R1X — Native PAW3311 Configurator")
-            .with_inner_size([1020.0, 680.0])
-            .with_min_inner_size([840.0, 540.0]),
+            .with_title(GUI_WINDOW_TITLE)
+            .with_icon(app_icon)
+            .with_inner_size([1060.0, 690.0])
+            .with_min_inner_size([880.0, 560.0]),
         ..Default::default()
     };
 

@@ -9,11 +9,12 @@ use std::time::Duration;
 use bkr1x_hal::profile::{format_light_mode, parse_light_mode};
 use bkr1x_hal::{
     Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
-    send_ipc_request,
+    install_user_application, is_autostart_enabled, is_daemon_running, resolve_sibling_binary,
+    send_ipc_request, set_autostart_enabled, uninstall_user_application,
 };
 use bkr1x_protocol::{
     ChecksumStrategy, DecodedPacket, LodHeight, MacroStep, MouseConfig, PacketCodec, PollingRate,
-    validate_dpi,
+    ScrollDirection, validate_dpi,
 };
 use clap::{Parser, Subcommand};
 
@@ -107,6 +108,43 @@ enum Commands {
         /// Directory containing `.js` chunks.
         bundle_dir: PathBuf,
     },
+
+    /// Install BK-R1X into your user profile, create Start Menu shortcut, register Windows Startup, and launch the System Tray icon.
+    Install {
+        /// Skip registering automatic launch at Windows login.
+        #[arg(long)]
+        no_autostart: bool,
+        /// Do not immediately start the background System Tray daemon after installing.
+        #[arg(long)]
+        no_start_tray: bool,
+    },
+
+    /// Stop the System Tray daemon and remove Windows Startup + Start Menu entries.
+    Uninstall,
+
+    /// Launch or focus the native BK-R1X GUI configurator window.
+    Open,
+
+    /// Control the background System Tray daemon (`start`, `stop`, `status`, `autostart`).
+    Tray {
+        #[command(subcommand)]
+        action: TrayAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TrayAction {
+    /// Start `bkr1x-daemon` in the background taskbar notification area if not already running.
+    Start,
+    /// Gracefully stop the running `bkr1x-daemon` System Tray process.
+    Stop,
+    /// Show whether the System Tray daemon is running and whether Windows Startup is enabled.
+    Status,
+    /// Enable or disable automatic launch at Windows login (`on` / `off`).
+    Autostart {
+        #[arg(value_parser = ["on", "off", "true", "false"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -186,6 +224,13 @@ fn run(cli: Cli) -> Result<(), String> {
         },
         Commands::SniffVerify { raw_hex, checksum } => cmd_sniff_verify(&raw_hex, &checksum),
         Commands::AnalyzeBundle { bundle_dir } => bundle_scan::scan_bundle_directory(&bundle_dir),
+        Commands::Install {
+            no_autostart,
+            no_start_tray,
+        } => cmd_install(!no_autostart, !no_start_tray),
+        Commands::Uninstall => cmd_uninstall(),
+        Commands::Open => cmd_open(),
+        Commands::Tray { action } => cmd_tray(action),
     }
 }
 
@@ -207,12 +252,17 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
 
     let mut dev = Bkr1xDevice::open_auto()?;
     let _ = dev.sync_all()?;
+    let info = dev.info().clone();
     let st = dev.state();
     let cfg = &st.config;
+    let raw_buttons: [[u8; 4]; 8] = core::array::from_fn(|i| st.buttons.slots[i].to_bytes());
     Ok(DaemonStatusSnapshot {
         connected: true,
         online: st.online,
         connection_mode: dev.mode().as_str().to_owned(),
+        vendor_id: info.vendor_id,
+        product_id: info.product_id,
+        product_name: info.product_name,
         firmware_version: st.firmware.to_string(),
         battery_percent: st.battery.percent,
         charging: st.battery.charging,
@@ -225,9 +275,14 @@ fn fetch_status_snapshot(direct: bool, refresh: bool) -> Result<DaemonStatusSnap
         motion_sync: cfg.sensor_flags.motion_sync,
         angle_snapping: cfg.sensor_flags.angle_snapping,
         ripple_control: cfg.sensor_flags.ripple_control,
+        reverse_scroll: cfg.scroll_direction == ScrollDirection::Reverse,
+        highspeed_mode: cfg.highspeed_mode,
+        wakeup_on_move: cfg.wakeup_on_move,
+        move_lights_off: cfg.move_lights_off,
         sleep_minutes: cfg.sleep_minutes,
         light_mode: format_light_mode(cfg.light_mode).to_owned(),
         active_profile: None,
+        button_slots: Some(raw_buttons),
     })
 }
 
@@ -648,4 +703,133 @@ fn format_hex_slice(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn spawn_detached_process(exe: &Path, args: &[&str]) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed spawning {}: {e}", exe.display()))
+}
+
+fn cmd_install(enable_autostart: bool, start_tray_now: bool) -> Result<(), String> {
+    let summary = install_user_application(enable_autostart)?;
+    println!("Fire Phoenix BK-R1X — Installed Successfully");
+    println!("──────────────────────────────────────────────");
+    println!("  Install Directory : {}", summary.install_dir.display());
+    println!("  Tray Daemon       : {}", summary.daemon_exe.display());
+    println!("  GUI Configurator  : {}", summary.gui_exe.display());
+    if let Some(lnk) = &summary.start_menu_shortcut {
+        println!("  Start Menu Entry  : {}", lnk.display());
+    }
+    println!(
+        "  Windows Startup   : {}",
+        if summary.autostart_registered {
+            "Enabled (HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\FirePhoenixBKR1X)"
+        } else {
+            "Skipped (--no-autostart)"
+        }
+    );
+
+    if start_tray_now {
+        spawn_detached_process(&summary.daemon_exe, &["--silent-if-running"])?;
+        std::thread::sleep(Duration::from_millis(350));
+        if is_daemon_running() {
+            println!("  System Tray State : Running in taskbar notification area");
+        } else {
+            println!("  System Tray State : Launched");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_uninstall() -> Result<(), String> {
+    uninstall_user_application()?;
+    println!("Stopped background System Tray daemon and removed Windows Startup + Start Menu entries.");
+    Ok(())
+}
+
+fn cmd_open() -> Result<(), String> {
+    if let Ok(IpcResponse::Ok { .. }) = send_ipc_request(&IpcRequest::OpenGui) {
+        println!("Opened / focused Fire Phoenix BK-R1X GUI via System Tray daemon.");
+        return Ok(());
+    }
+    let gui_exe = resolve_sibling_binary("bkr1x-gui")
+        .ok_or_else(|| "could not locate bkr1x-gui binary".to_owned())?;
+    spawn_detached_process(&gui_exe, &[])?;
+    println!("Launched {}", gui_exe.display());
+    Ok(())
+}
+
+fn cmd_tray(action: TrayAction) -> Result<(), String> {
+    match action {
+        TrayAction::Start => {
+            if is_daemon_running() {
+                println!("System Tray daemon (bkr1x-daemon) is already running.");
+                return Ok(());
+            }
+            let daemon_exe = resolve_sibling_binary("bkr1x-daemon")
+                .ok_or_else(|| "could not locate bkr1x-daemon binary".to_owned())?;
+            spawn_detached_process(&daemon_exe, &["--silent-if-running"])?;
+            std::thread::sleep(Duration::from_millis(350));
+            println!(
+                "Started System Tray daemon ({}) -> Running: {}",
+                daemon_exe.display(),
+                is_daemon_running()
+            );
+            Ok(())
+        }
+        TrayAction::Stop => {
+            match send_ipc_request(&IpcRequest::Shutdown) {
+                Ok(_) => println!("Sent clean shutdown signal to System Tray daemon."),
+                Err(_) => println!("System Tray daemon was not running."),
+            }
+            Ok(())
+        }
+        TrayAction::Status => {
+            println!("Fire Phoenix BK-R1X — System Tray & Startup");
+            println!("──────────────────────────────────────────────");
+            println!(
+                "  System Tray Daemon : {}",
+                if is_daemon_running() {
+                    "Running"
+                } else {
+                    "Stopped"
+                }
+            );
+            println!(
+                "  Launch at Login    : {}",
+                if is_autostart_enabled() {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            );
+            Ok(())
+        }
+        TrayAction::Autostart { state } => {
+            let enable = matches!(state.as_str(), "on" | "true");
+            set_autostart_enabled(enable, None)?;
+            println!(
+                "Launch at Windows Login: {}",
+                if enable { "Enabled" } else { "Disabled" }
+            );
+            Ok(())
+        }
+    }
 }

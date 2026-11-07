@@ -17,13 +17,35 @@ Ultra-lightweight (< 2 MB background RSS, 0.0% idle CPU) native Rust driver suit
 
 - **`crates/bkr1x-protocol`**: `#![no_std]`, zero-heap-allocation packet encoder/decoder, configurable `ChecksumStrategy` (`None`, `SumComplement`, `Xor`, `Crc16Ccitt`), 4096-byte macro compiler, and strict PAW3311 bounds validator.
 - **`crates/bkr1x-hal`**: Safe cross-platform HID abstraction (`hidraw` on Linux, `hid.dll` on Windows) targeting strictly `UsagePage 0xFF00..=0xFFFF`, Bluetooth mode detection, 2.4GHz sleep handling (`150ms` timeout + backoff), TOML/JSON profile engine, and IPC transport.
-- **`crates/bkr1x-daemon`**: Zero-tokio event-driven background service exposing sub-millisecond JSON-line IPC (`/run/user/$UID/bkr1x.sock` on Linux, `\\.\pipe\bkr1x-daemon` on Windows) and optional foreground per-application profile switching.
-- **`crates/bkr1x-cli`**: Fast CLI for telemetry queries, direct sensor configuration, TOML/JSON profile flashing, raw hex packet verification, and static JS bundle scanning.
-- **`crates/bkr1x-gui`**: Reactive dark-themed native configurator built on `eframe` / `egui` (`glow` OpenGL backend) with 0.0% idle CPU and a real-time Raw HID Wire Debugger.
+- **`crates/bkr1x-daemon`**: Silent background service & native Windows System Tray ("taskbar notification area") host (`#![windows_subsystem = "windows"]`, pure Win32 `Shell_NotifyIconW`, `0.0%` idle CPU) exposing sub-millisecond JSON-line IPC (`/run/user/$UID/bkr1x.sock` on Linux, `\\.\pipe\bkr1x-daemon` on Windows) and automatic per-game profile switching.
+- **`crates/bkr1x-cli`**: Fast CLI for user-profile installation (`install` / `uninstall` / `tray`), telemetry queries, direct sensor configuration, TOML/JSON profile flashing, raw hex packet verification, and static JS bundle scanning.
+- **`crates/bkr1x-gui`**: On-demand reactive dark-themed native configurator built on `eframe` / `egui` (`glow` OpenGL backend) with `0.0%` idle CPU, G HUB-style **Profiles & Startup** manager, and a real-time Raw HID Wire Debugger. Exiting the window frees 100% of OpenGL/GPU memory while `bkr1x-daemon` stays resident in the taskbar tray.
 - **`tools/`**: WebHID Tampermonkey/DevTools sniffer (`bkr1x-webhid-sniffer.user.js`) and static JS bundle extractor (`analyze_bundle.py`).
 - **`dist/linux/`**: Userspace `udev` rules (`99-bkr1x-hidraw.rules`) and `systemd --user` service unit (`bkr1x-daemon.service`).
 
-## Quick Start
+## Windows Desktop Installation (System Tray + Auto-Start on Boot)
+
+Like Logitech G HUB—without the 400 MB Electron/CEF overhead—`bkr1x-daemon.exe` runs silently in your Windows taskbar notification area with a live battery-colored mouse icon:
+
+- **Left-click (or double-click) the tray icon**: Opens or focuses `bkr1x-gui.exe` immediately.
+- **Close (`X`) the GUI window**: Frees 100% of GUI/OpenGL memory while keeping the lightweight tray icon active in the taskbar.
+- **Right-click the tray icon**: Native quick menu for 1-click **DPI Sensitivity**, **Polling Rate**, **Saved Profiles**, **Launch at Windows Startup**, **Refresh Telemetry**, and **Quit BK-R1X**.
+
+```powershell
+# Build stripped fat-LTO release binaries
+cargo build --release --workspace
+
+# Install into %LOCALAPPDATA%\Programs\BKR1X, add Start Menu shortcut,
+# register Windows login auto-start, and start the System Tray icon immediately:
+.\target\release\bkr1x-cli.exe install
+
+# Manage tray & startup from CLI anytime:
+.\target\release\bkr1x-cli.exe tray status
+.\target\release\bkr1x-cli.exe open
+.\target\release\bkr1x-cli.exe uninstall
+```
+
+## Quick Start (CLI & Direct Commands)
 
 ```bash
 # Build optimized release binaries

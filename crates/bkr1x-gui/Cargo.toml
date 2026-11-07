@@ -13,3 +13,9 @@ path = "src/main.rs"
 bkr1x-protocol.workspace = true
 bkr1x-hal.workspace = true
 eframe.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

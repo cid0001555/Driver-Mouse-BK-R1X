@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::DeviceError;
-use crate::profile::HardwareProfile;
+use crate::profile::{HardwareProfile, MacroProfileEntry};
 
 /// Windows Named Pipe endpoint path.
 pub const WINDOWS_NAMED_PIPE: &str = r"\\.\pipe\bkr1x-daemon";
@@ -24,7 +24,6 @@ pub fn unix_socket_path() -> PathBuf {
     }
     #[cfg(unix)]
     {
-        // Fallback if XDG_RUNTIME_DIR is unset in minimal window managers
         let uid = std::env::var("UID").unwrap_or_else(|_| "1000".to_owned());
         let run_user = PathBuf::from(format!("/run/user/{uid}"));
         if run_user.is_dir() {
@@ -38,26 +37,56 @@ pub fn unix_socket_path() -> PathBuf {
     }
 }
 
+/// Serializable wire trace frame transferred from `bkr1x-daemon` to `bkr1x-gui`'s Raw HID Debugger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcWireTrace {
+    pub timestamp_unix_ms: u64,
+    pub is_out: bool,
+    pub report_id: u8,
+    pub payload_hex: String,
+    pub summary: String,
+}
+
 /// JSON-line request sent to `bkr1x-daemon`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum IpcRequest {
     /// Returns cached status immediately in < 1ms without waking USB/2.4GHz bus.
     Status,
-    /// Forces an immediate hardware battery + config refresh from the mouse.
+    /// Returns full hardware state (config, buttons, VID/PID, recent raw HID frames) for `bkr1x-gui`.
+    GetFullState,
+    /// Forces an immediate hardware battery + config + buttons refresh from the mouse.
     Refresh,
+    /// Switches active DPI immediately (used by System Tray quick menu & CLI).
+    SetQuickDpi { dpi: u16 },
+    /// Switches polling rate immediately (used by System Tray quick menu & CLI).
+    SetQuickRate { rate_hz: u16 },
+    /// Flashes 8 × 4-byte button mappings through the daemon's single HID handle.
+    FlashButtons { raw_slots: [[u8; 4]; 8] },
+    /// Compiles and flashes hardware macros through the daemon's single HID handle.
+    FlashMacros { macros: Vec<MacroProfileEntry> },
     /// Applies a validated [`HardwareProfile`] through the daemon's open handle.
     ApplyProfile { profile: Box<HardwareProfile> },
-    /// Requests clean daemon shutdown.
+    /// Reloads saved per-application game profiles from `%APPDATA%\bkr1x\profiles`.
+    ReloadProfiles,
+    /// Asks the running tray daemon to launch or focus `bkr1x-gui`.
+    OpenGui,
+    /// Requests clean daemon & tray shutdown.
     Shutdown,
 }
 
-/// Cached telemetry snapshot returned by `bkr1x-daemon` in < 1ms.
+/// Cached telemetry & full configuration snapshot returned by `bkr1x-daemon`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatusSnapshot {
     pub connected: bool,
     pub online: bool,
     pub connection_mode: String,
+    #[serde(default)]
+    pub vendor_id: u16,
+    #[serde(default)]
+    pub product_id: u16,
+    #[serde(default)]
+    pub product_name: String,
     pub firmware_version: String,
     pub battery_percent: u8,
     pub charging: bool,
@@ -70,24 +99,46 @@ pub struct DaemonStatusSnapshot {
     pub motion_sync: bool,
     pub angle_snapping: bool,
     pub ripple_control: bool,
+    #[serde(default)]
+    pub reverse_scroll: bool,
+    #[serde(default)]
+    pub highspeed_mode: bool,
+    #[serde(default = "bool_true")]
+    pub wakeup_on_move: bool,
+    #[serde(default = "bool_true")]
+    pub move_lights_off: bool,
     pub sleep_minutes: u8,
     pub light_mode: String,
     pub active_profile: Option<String>,
+    #[serde(default)]
+    pub button_slots: Option<[[u8; 4]; 8]>,
+}
+
+fn bool_true() -> bool {
+    true
 }
 
 /// JSON-line response emitted by `bkr1x-daemon`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcResponse {
     Ok {
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot: Option<DaemonStatusSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        traces: Option<Vec<IpcWireTrace>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
     Error {
         message: String,
     },
+}
+
+/// Checks whether `bkr1x-daemon` is currently reachable over IPC.
+pub fn is_daemon_running() -> bool {
+    matches!(send_ipc_request(&IpcRequest::Status), Ok(IpcResponse::Ok { .. }))
 }
 
 /// Sends a single IPC request to the running `bkr1x-daemon` and reads its JSON-line reply.
@@ -108,7 +159,7 @@ pub fn send_ipc_request(req: &IpcRequest) -> Result<IpcResponse, DeviceError> {
                 path.display()
             ))
         })?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(2500)));
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         stream
             .write_all(line.as_bytes())
