@@ -5,6 +5,7 @@ mod panels;
 mod worker;
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
@@ -17,19 +18,36 @@ use bkr1x_protocol::{
     DEFAULT_STAGE_COLORS, HardwareStateMachine, MAX_DPI_STAGES, MacroInput, MacroStep,
     MouseClickButton,
 };
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, CornerRadius, Stroke};
+use flate2::read::DeflateDecoder;
 
-use crate::panels::MacroLoopKind;
+use crate::panels::{
+    AssignmentsSubTab, BG_CANVAS_BLACK, BG_CARD_CHARCOAL, BG_CONTROL_SLATE, BG_HOVER_SLATE,
+    CYAN_ACCENT, LightingZone, MacroLoopKind, ProfilesSubTab, RailTab, SensitivitySubTab,
+    TEXT_MUTED_GRAY, TEXT_WHITE, TelemetrySubTab, rgb_to_hsv,
+};
 use crate::worker::{UiMacroSlot, UiTraceRow, WorkerCommand, WorkerEvent, spawn_hardware_worker};
 
 pub(crate) const MAX_UI_TRACE_LOG: usize = 128;
+pub(crate) const MOUSE_PHOTO_WIDTH: usize = 300;
+pub(crate) const MOUSE_PHOTO_HEIGHT: usize = 528;
+const MOUSE_PHOTO_DEFLATE: &[u8] = include_bytes!("../assets/bkr1x_mouse_300x528.deflate");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ActiveTab {
-    Performance,
-    ButtonsAndMacros,
-    ProfilesAndStartup,
-    TelemetryInspector,
+fn load_mouse_photo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let expected_len = MOUSE_PHOTO_WIDTH * MOUSE_PHOTO_HEIGHT * 4;
+    let mut rgba = Vec::with_capacity(expected_len);
+    let mut decoder = DeflateDecoder::new(MOUSE_PHOTO_DEFLATE);
+    let _ = decoder.read_to_end(&mut rgba);
+    if rgba.len() != expected_len {
+        rgba.resize(expected_len, 0);
+    }
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied([MOUSE_PHOTO_WIDTH, MOUSE_PHOTO_HEIGHT], &rgba);
+    ctx.load_texture(
+        "bkr1x_mouse_photo",
+        color_image,
+        egui::TextureOptions::LINEAR,
+    )
 }
 
 /// Ensures `bkr1x-daemon` is active so closing the OpenGL window leaves the System Tray running.
@@ -55,7 +73,20 @@ pub(crate) fn ensure_tray_daemon_spawned() -> bool {
 }
 
 pub(crate) struct Bkr1xGuiApp {
-    pub(crate) tab: ActiveTab,
+    pub(crate) mouse_texture: egui::TextureHandle,
+    pub(crate) rail_tab: RailTab,
+    pub(crate) lighting_zone: LightingZone,
+    pub(crate) sensitivity_sub_tab: SensitivitySubTab,
+    pub(crate) assignments_sub_tab: AssignmentsSubTab,
+    pub(crate) profiles_sub_tab: ProfilesSubTab,
+    pub(crate) telemetry_sub_tab: TelemetrySubTab,
+    pub(crate) active_profile_label: String,
+    pub(crate) show_settings_modal: bool,
+
+    pub(crate) lighting_hsv: [f32; 3],
+    pub(crate) primary_rgb: [u8; 3],
+    pub(crate) logo_rgb: [u8; 3],
+
     pub(crate) hw_state: HardwareStateMachine,
     pub(crate) connected_device_label: Option<String>,
     pub(crate) connected_via_daemon: bool,
@@ -99,7 +130,8 @@ pub(crate) struct Bkr1xGuiApp {
 
 impl Bkr1xGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_dark_technical_theme(&cc.egui_ctx);
+        configure_ghub_theme(&cc.egui_ctx);
+        let mouse_texture = load_mouse_photo_texture(&cc.egui_ctx);
         let tray_started = ensure_tray_daemon_spawned();
         let saved_profiles = list_saved_profiles();
         let autostart_enabled = is_autostart_enabled();
@@ -125,16 +157,31 @@ impl Bkr1xGuiApp {
             ],
         };
 
+        let initial_rgb = [0x00, 0xB8, 0xFC];
+        let mut stage_colors = DEFAULT_STAGE_COLORS;
+        stage_colors[2] = initial_rgb;
+
         Self {
-            tab: ActiveTab::Performance,
+            mouse_texture,
+            rail_tab: RailTab::Lighting,
+            lighting_zone: LightingZone::Primary,
+            sensitivity_sub_tab: SensitivitySubTab::Dpi,
+            assignments_sub_tab: AssignmentsSubTab::Buttons,
+            profiles_sub_tab: ProfilesSubTab::Profiles,
+            telemetry_sub_tab: TelemetrySubTab::Telemetry,
+            active_profile_label: "DEFAULT".to_owned(),
+            show_settings_modal: false,
+            lighting_hsv: rgb_to_hsv(initial_rgb),
+            primary_rgb: initial_rgb,
+            logo_rgb: initial_rgb,
             hw_state: HardwareStateMachine::new(),
             connected_device_label: None,
             connected_via_daemon: false,
             tray_agent_running: tray_started,
             autostart_enabled,
             last_error: None,
-            status_banner: "Synchronizing with BK-R1X hardware...".to_owned(),
-            stage_colors: DEFAULT_STAGE_COLORS,
+            status_banner: "SYNCHRONIZING HARDWARE...".to_owned(),
+            stage_colors,
             selected_slot: 0,
             edit_sc_ctrl: true,
             edit_sc_shift: false,
@@ -151,7 +198,7 @@ impl Bkr1xGuiApp {
             new_step_mouse_btn: MouseClickButton::Left,
             new_step_delay_ms: 15,
             saved_profiles,
-            new_profile_name: "My Custom Profile".to_owned(),
+            new_profile_name: "DEFAULT".to_owned(),
             new_profile_process: String::new(),
             show_raw_debugger_drawer: false,
             trace_entries: VecDeque::with_capacity(MAX_UI_TRACE_LOG),
@@ -183,12 +230,12 @@ impl Bkr1xGuiApp {
                         Some(format!("{product_name} (0x{vid:04X}:0x{pid:04X})"));
                     self.last_error = None;
                     self.status_banner = format!(
-                        "Connected via {} {} — Firmware v{} · Closing window keeps BK-R1X active in System Tray",
+                        "{} {} · FW v{}",
                         self.hw_state.connection.map_or("USB", |m| m.as_str()),
                         if via_daemon {
-                            "(Tray Agent)"
+                            "TRAY AGENT"
                         } else {
-                            "(Direct HID)"
+                            "DIRECT HID"
                         },
                         self.hw_state.firmware
                     );
@@ -227,47 +274,45 @@ impl eframe::App for Bkr1xGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_worker_events();
 
-        egui::TopBottomPanel::top("bkr1x_top_bar")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(8.0))
+        egui::TopBottomPanel::top("ghub_top_bar")
+            .exact_height(46.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG_CANVAS_BLACK)
+                    .inner_margin(egui::Margin::symmetric(18, 8)),
+            )
             .show(ctx, |ui| {
                 self.draw_top_bar(ui);
             });
 
-        egui::TopBottomPanel::bottom("bkr1x_status_footer")
-            .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(6.0))
+        egui::TopBottomPanel::bottom("ghub_bottom_dock")
+            .exact_height(if self.show_raw_debugger_drawer {
+                230.0
+            } else {
+                68.0
+            })
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG_CANVAS_BLACK)
+                    .inner_margin(egui::Margin::symmetric(18, 6)),
+            )
             .show(ctx, |ui| {
-                if self.show_raw_debugger_drawer && self.tab != ActiveTab::TelemetryInspector {
-                    self.draw_raw_debugger_table(ui, 150.0);
-                    ui.add_space(4.0);
-                }
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&self.status_banner)
-                            .size(12.0)
-                            .color(Color32::from_rgb(169, 177, 214)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Tray Background < 2 MB · Reactive OpenGL 0% Idle CPU")
-                                .size(11.0)
-                                .color(Color32::from_rgb(100, 108, 135)),
-                        );
-                    });
-                });
+                self.draw_bottom_dock(ui);
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(16, 18, 25))
-                    .inner_margin(10.0),
+                    .fill(BG_CANVAS_BLACK)
+                    .inner_margin(egui::Margin::symmetric(18, 8)),
             )
-            .show(ctx, |ui| match self.tab {
-                ActiveTab::Performance => self.draw_performance_panel(ui),
-                ActiveTab::ButtonsAndMacros => self.draw_buttons_and_macros_panel(ui),
-                ActiveTab::ProfilesAndStartup => self.draw_profiles_and_startup_panel(ui),
-                ActiveTab::TelemetryInspector => self.draw_telemetry_and_inspector_panel(ui),
+            .show(ctx, |ui| {
+                self.draw_ghub_workspace(ui);
             });
+
+        if self.show_settings_modal {
+            self.draw_settings_modal(ctx);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -278,14 +323,62 @@ impl eframe::App for Bkr1xGuiApp {
     }
 }
 
-fn configure_dark_technical_theme(ctx: &egui::Context) {
+fn configure_ghub_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(16);
+
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(20, 22, 31);
-    visuals.window_fill = Color32::from_rgb(20, 22, 31);
-    visuals.extreme_bg_color = Color32::from_rgb(13, 14, 20);
-    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(26, 29, 41);
-    visuals.selection.bg_fill = Color32::from_rgb(56, 92, 178);
-    ctx.set_visuals(visuals);
+    visuals.dark_mode = true;
+    visuals.panel_fill = BG_CANVAS_BLACK;
+    visuals.window_fill = BG_CARD_CHARCOAL;
+    visuals.extreme_bg_color = BG_CANVAS_BLACK;
+    visuals.faint_bg_color = BG_CARD_CHARCOAL;
+    visuals.override_text_color = None;
+
+    let sharp = CornerRadius::same(2);
+    visuals.window_corner_radius = sharp;
+    visuals.menu_corner_radius = sharp;
+    visuals.window_shadow = egui::Shadow::NONE;
+    visuals.popup_shadow = egui::Shadow::NONE;
+    visuals.window_stroke = Stroke::new(1.0_f32, BG_CONTROL_SLATE);
+
+    visuals.widgets.noninteractive.bg_fill = BG_CARD_CHARCOAL;
+    visuals.widgets.noninteractive.weak_bg_fill = BG_CARD_CHARCOAL;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_MUTED_GRAY);
+    visuals.widgets.noninteractive.corner_radius = sharp;
+
+    visuals.widgets.inactive.bg_fill = BG_CONTROL_SLATE;
+    visuals.widgets.inactive.weak_bg_fill = BG_CONTROL_SLATE;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+    visuals.widgets.inactive.corner_radius = sharp;
+
+    visuals.widgets.hovered.bg_fill = BG_HOVER_SLATE;
+    visuals.widgets.hovered.weak_bg_fill = BG_HOVER_SLATE;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, CYAN_ACCENT);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, TEXT_WHITE);
+    visuals.widgets.hovered.corner_radius = sharp;
+
+    visuals.widgets.active.bg_fill = CYAN_ACCENT;
+    visuals.widgets.active.weak_bg_fill = CYAN_ACCENT;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, TEXT_WHITE);
+    visuals.widgets.active.corner_radius = sharp;
+
+    visuals.widgets.open.bg_fill = BG_CONTROL_SLATE;
+    visuals.widgets.open.weak_bg_fill = BG_CONTROL_SLATE;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, CYAN_ACCENT);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+    visuals.widgets.open.corner_radius = sharp;
+
+    visuals.selection.bg_fill = CYAN_ACCENT;
+    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT_WHITE);
+
+    style.visuals = visuals;
+    ctx.set_style(style);
 }
 
 #[cfg(windows)]
@@ -329,8 +422,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(GUI_WINDOW_TITLE)
             .with_icon(app_icon)
-            .with_inner_size([1060.0, 690.0])
-            .with_min_inner_size([880.0, 560.0]),
+            .with_inner_size([1120.0, 720.0])
+            .with_min_inner_size([920.0, 600.0]),
         ..Default::default()
     };
 

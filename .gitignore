@@ -1,5 +1,8 @@
 /target
 /bundles
+/dist/*.exe
+/dist/*.sha256
+/dist/release/
 /dist/windows/*.exe
 /dist/windows/*.sha256
 *.pdb

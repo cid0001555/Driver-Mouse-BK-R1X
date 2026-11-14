@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+default-members = ["crates/bkr1x-gui"]
 members = [
     "crates/bkr1x-protocol",
     "crates/bkr1x-hal",
@@ -10,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Fire Phoenix BK-R1X Open Driver Contributors"]

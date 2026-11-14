@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bkr1x-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bkr1x-hal",
  "bkr1x-protocol",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "bkr1x-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bkr1x-hal",
  "bkr1x-protocol",
@@ -183,18 +183,19 @@ dependencies = [
 
 [[package]]
 name = "bkr1x-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bkr1x-hal",
  "bkr1x-protocol",
  "eframe",
+ "flate2",
  "windows-sys 0.59.0",
  "winresource",
 ]
 
 [[package]]
 name = "bkr1x-hal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bkr1x-protocol",
  "flate2",
@@ -207,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "bkr1x-installer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bkr1x-hal",
  "eframe",
@@ -216,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bkr1x-protocol"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "block"
