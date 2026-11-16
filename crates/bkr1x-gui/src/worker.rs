@@ -4,12 +4,12 @@ use std::thread::{self, JoinHandle};
 use bkr1x_hal::profile::{MacroProfileEntry, MacroStepSpec, parse_light_mode};
 use bkr1x_hal::{
     Bkr1xDevice, DaemonStatusSnapshot, DeviceError, HardwareProfile, IpcRequest, IpcResponse,
-    IpcWireTrace, TraceDirection, WireTraceEntry, encode_hex_spaced, send_ipc_request,
+    send_ipc_request,
 };
 use bkr1x_protocol::{
-    BatteryTelemetry, ButtonAction, ButtonMapping, ChecksumStrategy, ConnectionMode,
-    FirmwareVersion, HardwareStateMachine, LightMode, LodHeight, MAX_DPI_STAGES, MacroInput,
-    MacroStep, MouseConfig, PollingRate, REPORT_PAYLOAD_LEN, ScrollDirection, SensorFlags,
+    BatteryTelemetry, ButtonAction, ButtonMapping, ConnectionMode, FirmwareVersion,
+    HardwareStateMachine, LightMode, LodHeight, MAX_DPI_STAGES, MacroInput, MacroStep, MouseConfig,
+    PollingRate, ScrollDirection, SensorFlags,
 };
 use eframe::egui;
 
@@ -17,48 +17,6 @@ use eframe::egui;
 pub struct UiMacroSlot {
     pub name: String,
     pub steps: Vec<MacroStep>,
-}
-
-/// Pre-formatted wire trace row so rendering the Raw HID Debugger performs zero per-frame allocations.
-#[derive(Debug, Clone)]
-pub struct UiTraceRow {
-    pub direction: TraceDirection,
-    pub report_id: u8,
-    pub payload_hex: String,
-    pub summary: String,
-}
-
-impl UiTraceRow {
-    pub fn from_ipc(trace: IpcWireTrace) -> Self {
-        Self {
-            direction: if trace.is_out {
-                TraceDirection::Out
-            } else {
-                TraceDirection::In
-            },
-            report_id: trace.report_id,
-            payload_hex: trace.payload_hex,
-            summary: trace.summary,
-        }
-    }
-
-    pub fn from_hal(entry: &WireTraceEntry) -> Self {
-        Self {
-            direction: entry.direction,
-            report_id: entry.report_id,
-            payload_hex: encode_hex_spaced(&entry.payload),
-            summary: entry.format_summary(ChecksumStrategy::None),
-        }
-    }
-
-    pub fn preview(report_id: u8, payload: &[u8; REPORT_PAYLOAD_LEN], summary: String) -> Self {
-        Self {
-            direction: TraceDirection::Out,
-            report_id,
-            payload_hex: encode_hex_spaced(payload),
-            summary,
-        }
-    }
 }
 
 pub enum WorkerCommand {
@@ -77,29 +35,13 @@ pub enum WorkerEvent {
         vid: u16,
         pid: u16,
         via_daemon: bool,
-        traces: Vec<UiTraceRow>,
     },
     FlashSuccess {
         message: String,
-        traces: Vec<UiTraceRow>,
     },
     ConnectionFailed {
         error: DeviceError,
     },
-}
-
-fn ipc_traces_to_ui(ipc_traces: Option<Vec<IpcWireTrace>>) -> Vec<UiTraceRow> {
-    ipc_traces
-        .unwrap_or_default()
-        .into_iter()
-        .map(UiTraceRow::from_ipc)
-        .collect()
-}
-
-fn drain_device_traces(dev: &mut Bkr1xDevice) -> Vec<UiTraceRow> {
-    let rows = dev.trace_log().iter().map(UiTraceRow::from_hal).collect();
-    dev.clear_trace_log();
-    rows
 }
 
 fn snapshot_to_hw_state(snap: &DaemonStatusSnapshot) -> HardwareStateMachine {
@@ -186,11 +128,8 @@ where
     if let Ok(resp) = send_ipc_request(&ipc_request) {
         *direct_dev = None;
         return match resp {
-            IpcResponse::Ok {
-                traces, message, ..
-            } => WorkerEvent::FlashSuccess {
+            IpcResponse::Ok { message, .. } => WorkerEvent::FlashSuccess {
                 message: message.unwrap_or_else(default_ipc_msg),
-                traces: ipc_traces_to_ui(traces),
             },
             IpcResponse::Error { message } => WorkerEvent::ConnectionFailed {
                 error: DeviceError::Ipc(message),
@@ -212,10 +151,10 @@ where
     };
 
     match direct_op(dev) {
-        Ok(message) => WorkerEvent::FlashSuccess {
-            message,
-            traces: drain_device_traces(dev),
-        },
+        Ok(message) => {
+            dev.clear_trace_log();
+            WorkerEvent::FlashSuccess { message }
+        }
         Err(error) => WorkerEvent::ConnectionFailed { error },
     }
 }
@@ -259,7 +198,6 @@ fn handle_connect_and_sync(
 
     if let Ok(IpcResponse::Ok {
         snapshot: Some(snap),
-        traces,
         ..
     }) = send_ipc_request(&ipc_req)
     {
@@ -278,7 +216,6 @@ fn handle_connect_and_sync(
                 vid: snap.vendor_id,
                 pid: snap.product_id,
                 via_daemon: true,
-                traces: ipc_traces_to_ui(traces),
             };
         }
     }
@@ -286,9 +223,9 @@ fn handle_connect_and_sync(
     match Bkr1xDevice::open_auto() {
         Ok(mut dev) => {
             let _ = dev.sync_all();
+            dev.clear_trace_log();
             let info = dev.info().clone();
             let state = Box::new(*dev.state());
-            let traces = drain_device_traces(&mut dev);
             *direct_dev = Some(dev);
             WorkerEvent::Connected {
                 state,
@@ -296,7 +233,6 @@ fn handle_connect_and_sync(
                 vid: info.vendor_id,
                 pid: info.product_id,
                 via_daemon: false,
-                traces,
             }
         }
         Err(error) => {

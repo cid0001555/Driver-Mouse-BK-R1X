@@ -4,7 +4,6 @@ mod keycodes;
 mod panels;
 mod worker;
 
-use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -23,12 +22,11 @@ use flate2::read::DeflateDecoder;
 
 use crate::panels::{
     AssignmentsSubTab, BG_CANVAS_BLACK, BG_CARD_CHARCOAL, BG_CONTROL_SLATE, BG_HOVER_SLATE,
-    CYAN_ACCENT, LightingZone, MacroLoopKind, ProfilesSubTab, RailTab, SensitivitySubTab,
-    TEXT_MUTED_GRAY, TEXT_WHITE, TelemetrySubTab, rgb_to_hsv,
+    CYAN_ACCENT, MacroLoopKind, ProfilesSubTab, RailTab, SensitivitySubTab, TEXT_MUTED_GRAY,
+    TEXT_WHITE,
 };
-use crate::worker::{UiMacroSlot, UiTraceRow, WorkerCommand, WorkerEvent, spawn_hardware_worker};
+use crate::worker::{UiMacroSlot, WorkerCommand, WorkerEvent, spawn_hardware_worker};
 
-pub(crate) const MAX_UI_TRACE_LOG: usize = 128;
 pub(crate) const MOUSE_PHOTO_WIDTH: usize = 300;
 pub(crate) const MOUSE_PHOTO_HEIGHT: usize = 528;
 const MOUSE_PHOTO_DEFLATE: &[u8] = include_bytes!("../assets/bkr1x_mouse_300x528.deflate");
@@ -75,17 +73,11 @@ pub(crate) fn ensure_tray_daemon_spawned() -> bool {
 pub(crate) struct Bkr1xGuiApp {
     pub(crate) mouse_texture: egui::TextureHandle,
     pub(crate) rail_tab: RailTab,
-    pub(crate) lighting_zone: LightingZone,
     pub(crate) sensitivity_sub_tab: SensitivitySubTab,
     pub(crate) assignments_sub_tab: AssignmentsSubTab,
     pub(crate) profiles_sub_tab: ProfilesSubTab,
-    pub(crate) telemetry_sub_tab: TelemetrySubTab,
     pub(crate) active_profile_label: String,
     pub(crate) show_settings_modal: bool,
-
-    pub(crate) lighting_hsv: [f32; 3],
-    pub(crate) primary_rgb: [u8; 3],
-    pub(crate) logo_rgb: [u8; 3],
 
     pub(crate) hw_state: HardwareStateMachine,
     pub(crate) connected_device_label: Option<String>,
@@ -117,11 +109,6 @@ pub(crate) struct Bkr1xGuiApp {
     pub(crate) saved_profiles: Vec<(PathBuf, HardwareProfile)>,
     pub(crate) new_profile_name: String,
     pub(crate) new_profile_process: String,
-
-    pub(crate) show_raw_debugger_drawer: bool,
-    pub(crate) trace_entries: VecDeque<UiTraceRow>,
-    pub(crate) custom_hex_input: String,
-    pub(crate) custom_hex_decoded: String,
 
     pub(crate) worker_tx: Sender<WorkerCommand>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
@@ -157,23 +144,17 @@ impl Bkr1xGuiApp {
             ],
         };
 
-        let initial_rgb = [0x00, 0xB8, 0xFC];
         let mut stage_colors = DEFAULT_STAGE_COLORS;
-        stage_colors[2] = initial_rgb;
+        stage_colors[2] = [0x00, 0xB8, 0xFC];
 
         Self {
             mouse_texture,
-            rail_tab: RailTab::Lighting,
-            lighting_zone: LightingZone::Primary,
+            rail_tab: RailTab::Sensitivity,
             sensitivity_sub_tab: SensitivitySubTab::Dpi,
             assignments_sub_tab: AssignmentsSubTab::Buttons,
             profiles_sub_tab: ProfilesSubTab::Profiles,
-            telemetry_sub_tab: TelemetrySubTab::Telemetry,
             active_profile_label: "DEFAULT".to_owned(),
             show_settings_modal: false,
-            lighting_hsv: rgb_to_hsv(initial_rgb),
-            primary_rgb: initial_rgb,
-            logo_rgb: initial_rgb,
             hw_state: HardwareStateMachine::new(),
             connected_device_label: None,
             connected_via_daemon: false,
@@ -200,12 +181,6 @@ impl Bkr1xGuiApp {
             saved_profiles,
             new_profile_name: "DEFAULT".to_owned(),
             new_profile_process: String::new(),
-            show_raw_debugger_drawer: false,
-            trace_entries: VecDeque::with_capacity(MAX_UI_TRACE_LOG),
-            custom_hex_input:
-                "00 55 0f ae 0a 2f 01 01 00 00 02 04 06 03 20 03 b0 04 40 06 80 0c 88 13 50 46"
-                    .to_owned(),
-            custom_hex_decoded: String::new(),
             worker_tx,
             worker_rx,
             worker_join,
@@ -221,7 +196,6 @@ impl Bkr1xGuiApp {
                     vid,
                     pid,
                     via_daemon,
-                    traces,
                 } => {
                     self.hw_state = *state;
                     self.connected_via_daemon = via_daemon;
@@ -239,12 +213,10 @@ impl Bkr1xGuiApp {
                         },
                         self.hw_state.firmware
                     );
-                    self.append_traces(traces);
                 }
-                WorkerEvent::FlashSuccess { message, traces } => {
+                WorkerEvent::FlashSuccess { message } => {
                     self.last_error = None;
                     self.status_banner = message;
-                    self.append_traces(traces);
                 }
                 WorkerEvent::ConnectionFailed { error } => {
                     self.status_banner = format!("Hardware notice: {error}");
@@ -257,15 +229,6 @@ impl Bkr1xGuiApp {
                     self.last_error = Some(error);
                 }
             }
-        }
-    }
-
-    fn append_traces(&mut self, incoming: Vec<UiTraceRow>) {
-        for entry in incoming {
-            if self.trace_entries.len() >= MAX_UI_TRACE_LOG {
-                self.trace_entries.pop_front();
-            }
-            self.trace_entries.push_back(entry);
         }
     }
 }
@@ -286,11 +249,7 @@ impl eframe::App for Bkr1xGuiApp {
             });
 
         egui::TopBottomPanel::bottom("ghub_bottom_dock")
-            .exact_height(if self.show_raw_debugger_drawer {
-                230.0
-            } else {
-                68.0
-            })
+            .exact_height(68.0)
             .frame(
                 egui::Frame::NONE
                     .fill(BG_CANVAS_BLACK)
